@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from pdf2md import Converter
+
+from pdf_converter.pdf2md import Converter
 
 
 def convert_pdf_to_md(
