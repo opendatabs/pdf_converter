@@ -31,7 +31,7 @@ def convert_pdf_to_md(
         print(f"PDF downloaded successfully as {pdf_path}")
     except requests.exceptions.RequestException as e:
         print(f"Failed to download PDF: {e}")
-        return f"Failed to download PDF: {e}"
+        return ""
 
     # Convert the PDF to Markdown
     converter = Converter(lib=method, input_file=pdf_path)
@@ -42,7 +42,7 @@ def convert_pdf_to_md(
             return f.read()
     except Exception as e:
         print(f"Failed to convert PDF to Markdown: {e}")
-        return f"Failed to convert PDF to Markdown: {e}"
+        return f""
 
 
 def add_markdown_column(
