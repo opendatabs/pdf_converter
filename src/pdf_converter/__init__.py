@@ -46,7 +46,11 @@ def convert_pdf_to_md(
 
 
 def add_markdown_column(
-    df: pd.DataFrame, url_column: str, method: str, md_column: str = None
+        df: pd.DataFrame,
+        url_column: str,
+        method: str,
+        md_column: str = None,
+        csv_output_path: Path = None
 ) -> pd.DataFrame:
     """
     Adds a column to the DataFrame containing Markdown converted from PDF URLs.
@@ -55,16 +59,24 @@ def add_markdown_column(
         df (pd.DataFrame): The input DataFrame.
         url_column (str): The name of the column containing PDF URLs.
         method (str): The conversion method to use in `convert_pdf_to_md`.
-        md_column (str, optional): Name for the new Markdown column. Defaults to '<url_column>_md_<method>'.
+        md_column (str, optional): Name for the new Markdown column.
+            Defaults to '<url_column>_md_<method>'.
+        csv_output_path (Path, optional): If provided, the DataFrame is saved to this CSV path
+            after each row is processed.
 
     Returns:
         pd.DataFrame: A copy of the DataFrame with an additional column containing Markdown strings.
     """
-
-    def convert_row(pdf_url):
-        return convert_pdf_to_md(pdf_url, method)
-
     if md_column is None:
         md_column = f"{url_column}_md_{method}"
-    df[md_column] = df[url_column].apply(convert_row)
+
+    df = df.copy()
+    df[md_column] = None  # Initialize column
+
+    for idx, row in df.iterrows():
+        md = convert_pdf_to_md(row[url_column], method)
+        df.at[idx, md_column] = md
+        if csv_output_path:
+            df.to_csv(csv_output_path, index=False)
+
     return df
