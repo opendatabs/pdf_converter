@@ -75,9 +75,10 @@ def add_markdown_column(
         df[md_column] = None
 
     for idx, row in df.iterrows():
-        md = convert_pdf_to_md(row[url_column], method)
-        df.at[idx, md_column] = md
-        if csv_output_path:
-            df.to_csv(csv_output_path, index=False)
+        if row[md_column] == "" or pd.isnull(row[md_column]):
+            md = convert_pdf_to_md(row[url_column], method)
+            df.at[idx, md_column] = md
+            if csv_output_path:
+                df.to_csv(csv_output_path, index=False)
 
     return df
