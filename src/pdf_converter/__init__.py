@@ -47,6 +47,11 @@ def convert_pdf_to_md(
         return f""
 
 
+import zipfile
+from pathlib import Path
+import pandas as pd
+
+
 def add_markdown_column(
     df: pd.DataFrame,
     url_column: str,
@@ -57,22 +62,21 @@ def add_markdown_column(
     md_name_column: str = None,
 ) -> pd.DataFrame:
     """
-    Adds a column to the DataFrame containing Markdown converted from PDF URLs,
-    and optionally writes individual Markdown files into a ZIP archive using names
-    derived from a specified DataFrame column.
+    Adds a column to the DataFrame containing Markdown converted from PDF URLs.
+    If a Markdown file already exists in the ZIP (based on md_name_column), it is reused.
 
     Args:
-        df (pd.DataFrame): The input DataFrame.
-        url_column (str): Column with PDF URLs to convert.
+        df (pd.DataFrame): Input DataFrame.
+        url_column (str): Column with PDF URLs.
         method (str): Conversion method to use in `convert_pdf_to_md`.
-        md_column (str, optional): Name for the new Markdown column.
+        md_column (str, optional): Name for the Markdown column.
             Defaults to '<url_column>_md_<method>'.
-        csv_output_path (Path, optional): If provided, saves the full DataFrame after each row.
-        zip_path (Path, optional): If provided, stores each Markdown file in this ZIP archive.
-        md_name_column (str, optional): Column to use for naming Markdown files inside the ZIP.
+        csv_output_path (Path, optional): If provided, saves the DataFrame after each row.
+        zip_path (Path, optional): Path to a ZIP file to cache/load Markdown files.
+        md_name_column (str, optional): Column used for naming Markdown files in the ZIP.
 
     Returns:
-        pd.DataFrame: A copy of the DataFrame with an additional column containing Markdown strings.
+        pd.DataFrame: DataFrame with the Markdown column populated.
     """
     if md_column is None:
         md_column = f"{url_column}_md_{method}"
@@ -82,22 +86,35 @@ def add_markdown_column(
         df[md_column] = None
 
     zip_file = None
-    if zip_path:
-        zip_mode = "a" if zip_path.exists() else "w"
-        zip_file = zipfile.ZipFile(zip_path, mode=zip_mode, compression=zipfile.ZIP_DEFLATED)
+    existing_zip_names = set()
+    if zip_path and zip_path.exists():
+        zip_file = zipfile.ZipFile(zip_path, mode="a", compression=zipfile.ZIP_DEFLATED)
+        existing_zip_names = set(zip_file.namelist())
+    elif zip_path:
+        zip_file = zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED)
 
     for idx, row in df.iterrows():
         if row[md_column] == "" or pd.isnull(row[md_column]):
-            md = convert_pdf_to_md(row[url_column], method)
-            df.at[idx, md_column] = md
+            filename = f"{row[md_name_column]}_{method}.md" if md_name_column else None
+            markdown = None
 
-            # Write to zip file
-            if zip_file and md_name_column:
-                filename = f"{row[md_name_column]}_{method}.md"
+            if zip_file and filename and filename in existing_zip_names:
                 try:
-                    zip_file.writestr(filename, md)
+                    with zip_file.open(filename) as f:
+                        markdown = f.read().decode("utf-8")
                 except Exception as e:
-                    print(f"⚠️ Failed to write {filename} to ZIP: {e}")
+                    print(f"⚠️ Failed to read {filename} from ZIP: {e}")
+
+            if markdown is None:
+                markdown = convert_pdf_to_md(row[url_column], method)
+                if zip_file and filename:
+                    try:
+                        zip_file.writestr(filename, markdown)
+                        existing_zip_names.add(filename)
+                    except Exception as e:
+                        print(f"⚠️ Failed to write {filename} to ZIP: {e}")
+
+            df.at[idx, md_column] = markdown
 
             if csv_output_path:
                 df.to_csv(csv_output_path, index=False)
