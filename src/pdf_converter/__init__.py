@@ -1,6 +1,5 @@
 import logging
 import zipfile
-from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -47,11 +46,6 @@ def convert_pdf_to_md(
         return f""
 
 
-import zipfile
-from pathlib import Path
-import pandas as pd
-
-
 def add_markdown_column(
     df: pd.DataFrame,
     url_column: str,
@@ -64,6 +58,7 @@ def add_markdown_column(
     """
     Adds a column to the DataFrame containing Markdown converted from PDF URLs.
     If a Markdown file already exists in the ZIP (based on md_name_column), it is reused.
+    Markdown files are written to the ZIP immediately after creation (ZIP opened per write).
 
     Args:
         df (pd.DataFrame): Input DataFrame.
@@ -85,31 +80,33 @@ def add_markdown_column(
     if md_column not in df.columns:
         df[md_column] = None
 
-    zip_file = None
+    # Preload list of existing files in ZIP
     existing_zip_names = set()
-    if zip_path and zip_path.exists():
-        zip_file = zipfile.ZipFile(zip_path, mode="a", compression=zipfile.ZIP_DEFLATED)
-        existing_zip_names = set(zip_file.namelist())
-    elif zip_path:
-        zip_file = zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED)
+    if zip_path and Path(zip_path).exists():
+        with zipfile.ZipFile(zip_path, mode="r") as zf:
+            existing_zip_names = set(zf.namelist())
 
     for idx, row in df.iterrows():
         if row[md_column] == "" or pd.isnull(row[md_column]):
             filename = f"{row[md_name_column]}_{method}.md" if md_name_column else None
             markdown = None
 
-            if zip_file and filename and filename in existing_zip_names:
+            # Reuse if already in ZIP
+            if zip_path and filename and filename in existing_zip_names:
                 try:
-                    with zip_file.open(filename) as f:
-                        markdown = f.read().decode("utf-8")
+                    with zipfile.ZipFile(zip_path, mode="r") as zf:
+                        with zf.open(filename) as f:
+                            markdown = f.read().decode("utf-8")
                 except Exception as e:
                     print(f"⚠️ Failed to read {filename} from ZIP: {e}")
 
+            # Else generate and write
             if markdown is None:
                 markdown = convert_pdf_to_md(row[url_column], method)
-                if zip_file and filename:
+                if zip_path and filename:
                     try:
-                        zip_file.writestr(filename, markdown)
+                        with zipfile.ZipFile(zip_path, mode="a", compression=zipfile.ZIP_DEFLATED) as zf:
+                            zf.writestr(filename, markdown)
                         existing_zip_names.add(filename)
                     except Exception as e:
                         print(f"⚠️ Failed to write {filename} to ZIP: {e}")
@@ -118,8 +115,5 @@ def add_markdown_column(
 
             if csv_output_path:
                 df.to_csv(csv_output_path, index=False)
-
-    if zip_file:
-        zip_file.close()
 
     return df
