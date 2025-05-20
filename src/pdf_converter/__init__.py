@@ -71,7 +71,8 @@ def add_markdown_column(
         md_column = f"{url_column}_md_{method}"
 
     df = df.copy()
-    df[md_column] = None  # Initialize column
+    if md_column not in df.columns:
+        df[md_column] = None
 
     for idx, row in df.iterrows():
         md = convert_pdf_to_md(row[url_column], method)
