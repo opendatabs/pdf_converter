@@ -1,6 +1,7 @@
 import logging
+import subprocess
+import sys
 import zipfile
-from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -23,33 +24,34 @@ def convert_pdf_to_md(
     Returns:
         str: The Markdown content as a string, or an error message if the process fails.
     """
-    # Download the PDF
-    logging.info(f"   Downloading PDF: {pdf_url}")
+    logging.info(f"Downloading PDF: {pdf_url}")
     try:
-        r_pdf = requests.get(pdf_url)
+        r_pdf = requests.get(pdf_url, timeout=10)
+        r_pdf.raise_for_status()
         with open(pdf_path, "wb") as file:
-            for chunk in r_pdf.iter_content(chunk_size=1024):
-                file.write(chunk)
-        print(f"PDF downloaded successfully as {pdf_path}")
-    except requests.exceptions.RequestException as e:
+            file.write(r_pdf.content)
+    except Exception as e:
         print(f"Failed to download PDF: {e}")
         return ""
 
-    # Convert the PDF to Markdown
-    converter = Converter(lib=method, input_file=pdf_path)
+    # Subprocess for crash isolation
     try:
-        converter.convert()
-        markdown_path = converter.output_file
-        with open(markdown_path, "r", encoding="utf-8") as f:
-            return f.read()
+        result = subprocess.run(
+            [sys.executable, "convert_single_pdf.py", str(pdf_path), method],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            print(f"[ERROR] Subprocess failed: {result.stderr}")
+            return ""
+        return result.stdout
+    except subprocess.TimeoutExpired:
+        print("Conversion timed out.")
+        return ""
     except Exception as e:
-        print(f"Failed to convert PDF to Markdown: {e}")
-        return f""
-
-
-import zipfile
-from pathlib import Path
-import pandas as pd
+        print(f"Unexpected error in subprocess: {e}")
+        return ""
 
 
 def add_markdown_column(
