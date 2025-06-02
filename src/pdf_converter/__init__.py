@@ -9,6 +9,8 @@ import requests
 
 from pdf_converter.pdf2md import Converter
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONVERT_SCRIPT = SCRIPT_DIR / "convert_single_pdf.py"
 
 def convert_pdf_to_md(
     pdf_url: str, method: str, pdf_path: Path = Path("temp.pdf")
@@ -37,7 +39,7 @@ def convert_pdf_to_md(
     # Subprocess for crash isolation
     try:
         result = subprocess.run(
-            [sys.executable, "convert_single_pdf.py", str(pdf_path), method],
+            [sys.executable, str(CONVERT_SCRIPT), str(pdf_path), method],
             capture_output=True,
             text=True,
             timeout=300,
@@ -104,7 +106,12 @@ def add_markdown_column(
                 try:
                     with zipfile.ZipFile(zip_path, mode="r") as zf:
                         with zf.open(filename) as f:
-                            markdown = f.read().decode("utf-8")
+                            content = f.read().decode("utf-8").strip()
+                            if content:
+                                markdown = content
+                            else:
+                                print(f"⚠️ Cached file {filename} is empty. Will reprocess PDF.")
+                                existing_zip_names.remove(filename)  # Force regeneration
                 except Exception as e:
                     print(f"⚠️ Failed to read {filename} from ZIP: {e}")
 
