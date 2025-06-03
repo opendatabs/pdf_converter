@@ -2,6 +2,7 @@ import logging
 import subprocess
 import sys
 import zipfile
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -11,6 +12,18 @@ from pdf_converter.pdf2md import Converter
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONVERT_SCRIPT = SCRIPT_DIR / "convert_single_pdf.py"
+
+
+def replace_in_zip(zip_path, filename, content):
+    temp_zip_path = zip_path.with_suffix(".tmp.zip")
+    with zipfile.ZipFile(zip_path, "r") as zf_in, \
+         zipfile.ZipFile(temp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf_out:
+        for item in zf_in.infolist():
+            if item.filename != filename:
+                zf_out.writestr(item, zf_in.read(item.filename))
+        zf_out.writestr(filename, content)
+    temp_zip_path.replace(zip_path)
+    
 
 def convert_pdf_to_md(
     pdf_url: str, method: str, pdf_path: Path = Path("temp.pdf")
@@ -116,12 +129,11 @@ def add_markdown_column(
                     print(f"⚠️ Failed to read {filename} from ZIP: {e}")
 
             # Else generate and write
-            if markdown is None:
+            if markdown is None or not markdown.strip():
                 markdown = convert_pdf_to_md(row[url_column], method)
-                if zip_path and filename:
+                if zip_path and filename and markdown.strip():
                     try:
-                        with zipfile.ZipFile(zip_path, mode="a", compression=zipfile.ZIP_DEFLATED) as zf:
-                            zf.writestr(filename, markdown)
+                        replace_in_zip(Path(zip_path), filename, markdown)
                         existing_zip_names.add(filename)
                     except Exception as e:
                         print(f"⚠️ Failed to write {filename} to ZIP: {e}")
