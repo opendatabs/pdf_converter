@@ -84,18 +84,14 @@ class Converter:
                                         font_size = current_font_size
 
                                     # Detect bold text
-                                    if (
-                                        "bold" in current_font or span["flags"] & 2
-                                    ):  # 2 is bold flag
+                                    if "bold" in current_font or span["flags"] & 2:  # 2 is bold flag
                                         is_bold = True
 
                                     line_text += current_text
 
                             if line_text.strip():
                                 # Determine if this might be a heading based on font size
-                                if (
-                                    font_size > 12
-                                ):  # Arbitrary threshold - adjust as needed
+                                if font_size > 12:  # Arbitrary threshold - adjust as needed
                                     is_heading = True
 
                                 text_blocks.append(
@@ -119,9 +115,7 @@ class Converter:
                 continue
 
             # Detect headings based on formatting and content
-            if block["is_heading"] or (
-                len(text) < 80 and not text.endswith((".", ",", ";", ":", "?", "!"))
-            ):
+            if block["is_heading"] or (len(text) < 80 and not text.endswith((".", ",", ";", ":", "?", "!"))):
                 # Determine heading level based on font size
                 if block["font_size"] >= 18:
                     md_lines.append(f"# {text}")
@@ -180,12 +174,8 @@ class Converter:
                 text_blocks = page.extract_words()  # Extract text blocks
                 char_data = page.objects.get("char", [])  # Get character-level metadata
 
-                font_sizes = [
-                    char["size"] for char in char_data if "size" in char
-                ]  # Extract font sizes
-                avg_font_size = (
-                    sum(font_sizes) / len(font_sizes) if font_sizes else 12
-                )  # Default to 12 if unknown
+                font_sizes = [char["size"] for char in char_data if "size" in char]  # Extract font sizes
+                avg_font_size = sum(font_sizes) / len(font_sizes) if font_sizes else 12  # Default to 12 if unknown
 
                 # Process each word and infer headings based on font size
                 for word in text_blocks:
@@ -206,12 +196,8 @@ class Converter:
                 # Extract Tables
                 tables = page.extract_tables()
                 for table in tables:
-                    structured_text.append(
-                        "\n| " + " | ".join(table[0]) + " |\n"
-                    )  # Markdown Table Header
-                    structured_text.append(
-                        "|" + " --- |" * len(table[0])
-                    )  # Table divider
+                    structured_text.append("\n| " + " | ".join(table[0]) + " |\n")  # Markdown Table Header
+                    structured_text.append("|" + " --- |" * len(table[0]))  # Table divider
                     for row in table[1:]:
                         structured_text.append("| " + " | ".join(row) + " |")
 
@@ -253,11 +239,7 @@ class Converter:
             with self.output_file.open("rb") as f:
                 bytes_data = f.read()
             b64 = base64.b64encode(bytes_data).decode()
-            mime_type = (
-                "application/pdf"
-                if self.output_file.suffix == ".pdf"
-                else "text/markdown"
-            )
+            mime_type = "application/pdf" if self.output_file.suffix == ".pdf" else "text/markdown"
             filename = os.path.basename(self.output_file)
             href = f'<a href="data:file/{mime_type};base64,{b64}" download="{filename}">{link_text}</a>'
             return href

@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+
 from pdf_converter.pdf2md import Converter
 
 if __name__ == "__main__":
