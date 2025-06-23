@@ -14,6 +14,9 @@ CONVERT_SCRIPT_TXT = SCRIPT_DIR / "convert_single_pdf2txt.py"
 
 
 def safe_filename(name):
+    # Convert name to string and replace invalid characters
+    if not isinstance(name, str):
+        name = str(name)
     return re.sub(r"[^a-zA-Z0-9_\-.]", "_", name)
 
 
