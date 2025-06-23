@@ -146,7 +146,7 @@ def convert_pdf_to_txt(pdf_url: str, method: str, pdf_path: Path = Path("temp.pd
 
     try:
         result = subprocess.run(
-            [sys.executable, str(SCRIPT_DIR / "convert_single_pdf_txt.py"), str(pdf_path), method],
+            [sys.executable, str(CONVERT_SCRIPT_TXT), str(pdf_path), method],
             capture_output=True,
             text=True,
             timeout=300,
