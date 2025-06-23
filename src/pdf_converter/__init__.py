@@ -79,7 +79,7 @@ def create_markdown_from_column(
     zip_path: Path,
     md_name_column: str,
     replace_all: bool = False,
-) -> pd.DataFrame:
+):
     """
     Converts PDFs to Markdown and stores them in a ZIP archive.
     Skips any file that already exists in the ZIP.
@@ -91,8 +91,6 @@ def create_markdown_from_column(
         zip_path (Path): Path to a ZIP file to cache/load Markdown files.
         md_name_column (str): Column used for naming Markdown files in the ZIP.
         replace_all (bool, optional): If True, replaces existing files in the ZIP. Defaults to False.
-    Returns:
-        pd.DataFrame: DataFrame with the Markdown column populated.
     """
     # Preload list of existing files in ZIP
     existing_zip_names = set()
@@ -100,7 +98,7 @@ def create_markdown_from_column(
         with zipfile.ZipFile(zip_path, mode="r") as zf:
             existing_zip_names = set(zf.namelist())
     else:
-        print(f"⚠️ ZIP file {zip_path} does not exist. Creating a new one.")
+        logging.error(f"⚠️ ZIP file {zip_path} does not exist. Creating a new one.")
         zip_path.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zip_path, mode="w") as zf:
             pass
@@ -116,9 +114,9 @@ def create_markdown_from_column(
                     replace_in_zip(Path(zip_path), filename, markdown)
                     existing_zip_names.add(filename)
                 except Exception as e:
-                    print(f"⚠️ Failed to write {filename} to ZIP: {e}")
+                    logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
 
-    return df
+    logging.info(f"Processed {len(df)} rows for Markdown conversion using method '{method}'")
 
 
 def convert_pdf_to_txt(pdf_url: str, method: str, pdf_path: Path = Path("temp.pdf")) -> str:
@@ -169,7 +167,7 @@ def create_text_from_column(
     zip_path: Path,
     txt_name_column: str,
     replace_all: bool = False,
-) -> pd.DataFrame:
+):
     """
     Converts PDFs to plain text and stores them in a ZIP archive.
     Skips any file that already exists in the ZIP.
@@ -181,16 +179,13 @@ def create_text_from_column(
         zip_path (Path): Path to a ZIP file to cache/load text files.
         txt_name_column (str): Column used for naming .txt files in the ZIP.
         replace_all (bool, optional): If True, replaces existing files in the ZIP. Defaults to False.
-
-    Returns:
-        pd.DataFrame: DataFrame with conversion status (if needed).
     """
     existing_zip_names = set()
     if Path(zip_path).exists():
         with zipfile.ZipFile(zip_path, mode="r") as zf:
             existing_zip_names = set(zf.namelist())
     else:
-        print(f"⚠️ ZIP file {zip_path} does not exist. Creating a new one.")
+        logging.error(f"⚠️ ZIP file {zip_path} does not exist. Creating a new one.")
         zip_path.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zip_path, mode="w") as zf:
             pass
@@ -205,6 +200,6 @@ def create_text_from_column(
                     replace_in_zip(Path(zip_path), filename, text)
                     existing_zip_names.add(filename)
                 except Exception as e:
-                    print(f"⚠️ Failed to write {filename} to ZIP: {e}")
+                    logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
 
-    return df
+    logging.info(f"Processed {len(df)} rows for text conversion using method '{method}'")
