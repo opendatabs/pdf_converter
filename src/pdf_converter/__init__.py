@@ -4,6 +4,7 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
+from tqdm import tqdm
 
 import pandas as pd
 import requests
@@ -106,10 +107,9 @@ def create_markdown_from_column(
         with zipfile.ZipFile(zip_path, mode="w") as zf:
             pass
 
+    progress_bar = tqdm(total=len(df), desc=f"Markdown ({method})", dynamic_ncols=True)
     for idx, row in df.iterrows():
         filename = f"{safe_filename(row[md_name_column])}_{method}.md"
-
-        # Generate and write Markdown if it doesn't exist in the ZIP
         if replace_all or filename not in existing_zip_names:
             markdown = convert_pdf_to_md(row[url_column], method)
             if markdown.strip():
@@ -118,6 +118,9 @@ def create_markdown_from_column(
                     existing_zip_names.add(filename)
                 except Exception as e:
                     logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
+        progress_bar.update(1)
+        tqdm.write(f"[{idx + 1}/{len(df)}] Markdown created: {filename}")
+    progress_bar.close()
 
     logging.info(f"Processed {len(df)} rows for Markdown conversion using method '{method}'")
 
@@ -193,9 +196,9 @@ def create_text_from_column(
         with zipfile.ZipFile(zip_path, mode="w") as zf:
             pass
 
+    progress_bar = tqdm(total=len(df), desc=f"Text ({method})", dynamic_ncols=True)
     for idx, row in df.iterrows():
         filename = f"{safe_filename(row[txt_name_column])}_{method}.txt"
-
         if replace_all or filename not in existing_zip_names:
             text = convert_pdf_to_txt(row[url_column], method)
             if text.strip():
@@ -204,5 +207,8 @@ def create_text_from_column(
                     existing_zip_names.add(filename)
                 except Exception as e:
                     logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
+        progress_bar.update(1)
+        tqdm.write(f"[{idx + 1}/{len(df)}] Text created: {filename}")
+    progress_bar.close()
 
     logging.info(f"Processed {len(df)} rows for text conversion using method '{method}'")
