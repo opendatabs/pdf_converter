@@ -34,6 +34,22 @@ def replace_in_zip(zip_path, filename, content):
     temp_zip_path.replace(zip_path)
 
 
+def _ensure_zip(zip_path: Path) -> set[str]:
+    """Make sure zip exists; return existing names."""
+    if Path(zip_path).exists():
+        with zipfile.ZipFile(zip_path, mode="r") as zf:
+            return set(zf.namelist())
+    logging.warning(f"ZIP {zip_path} does not exist. Creating a new one.")
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, mode="w"):
+        pass
+    return set()
+
+def _build_filenames(series: pd.Series, suffix: str) -> pd.Series:
+    # Vectorized safe filenames
+    return series.astype(str).map(safe_filename) + suffix
+
+
 def convert_pdf_to_md(pdf_url: str, method: str, pdf_path: Path = Path("temp.pdf")) -> str:
     """
     Downloads a PDF from a URL and converts it to Markdown using the specified conversion method.
@@ -84,45 +100,45 @@ def create_markdown_from_column(
     md_name_column: str,
     replace_all: bool = False,
 ):
-    """
-    Converts PDFs to Markdown and stores them in a ZIP archive.
-    Skips any file that already exists in the ZIP.
+    existing = _ensure_zip(zip_path)
+    suffix = f"_{method}.md"
 
-    Args:
-        df (pd.DataFrame): Input DataFrame.
-        url_column (str): Column with PDF URLs.
-        method (str): Conversion method to use in `convert_pdf_to_md`.
-        zip_path (Path): Path to a ZIP file to cache/load Markdown files.
-        md_name_column (str): Column used for naming Markdown files in the ZIP.
-        replace_all (bool, optional): If True, replaces existing files in the ZIP. Defaults to False.
-    """
-    # Preload list of existing files in ZIP
-    existing_zip_names = set()
-    if Path(zip_path).exists():
-        with zipfile.ZipFile(zip_path, mode="r") as zf:
-            existing_zip_names = set(zf.namelist())
-    else:
-        logging.error(f"⚠️ ZIP file {zip_path} does not exist. Creating a new one.")
-        zip_path.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path, mode="w") as zf:
-            pass
+    # Base filters: valid name+url
+    valid = df[[md_name_column, url_column]].dropna()
+    valid = valid[valid[url_column].astype(str).str.len() > 0]
 
-    progress_bar = tqdm(total=len(df), desc=f"Markdown ({method})", dynamic_ncols=True)
-    for idx, row in df.iterrows():
-        filename = f"{safe_filename(row[md_name_column])}_{method}.md"
-        if replace_all or filename not in existing_zip_names:
-            markdown = convert_pdf_to_md(row[url_column], method)
-            if markdown.strip():
-                try:
-                    replace_in_zip(Path(zip_path), filename, markdown)
-                    existing_zip_names.add(filename)
-                except Exception as e:
-                    logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
+    # Precompute filenames
+    filenames = _build_filenames(valid[md_name_column], suffix)
+    valid = valid.assign(__filename=filenames)
+
+    # If not replacing, drop rows whose target already exists
+    if not replace_all:
+        valid = valid[~valid["__filename"].isin(existing)]
+
+    # De-dup by target filename to avoid redoing same file
+    valid = valid.drop_duplicates(subset="__filename", keep="first")
+
+    if valid.empty:
+        logging.info("Nothing to do: all Markdown files already present.")
+        return
+
+    progress_bar = tqdm(total=len(valid), desc=f"Markdown ({method})", dynamic_ncols=True)
+
+    # Iterate only filtered rows, use itertuples for speed
+    for row in valid[[url_column, "__filename"]].itertuples(index=False, name=None):
+        url, filename = row
+        markdown = convert_pdf_to_md(url, method)
+        if markdown.strip():
+            try:
+                replace_in_zip(Path(zip_path), filename, markdown)
+                existing.add(filename)
+            except Exception as e:
+                logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
         progress_bar.update(1)
-        tqdm.write(f"[{idx + 1}/{len(df)}] Markdown created: {filename}")
-    progress_bar.close()
+        tqdm.write(f"Markdown created: {filename}")
 
-    logging.info(f"Processed {len(df)} rows for Markdown conversion using method '{method}'")
+    progress_bar.close()
+    logging.info(f"Processed {len(valid)} rows for Markdown conversion using '{method}'")
 
 
 def convert_pdf_to_txt(pdf_url: str, method: str, pdf_path: Path = Path("temp.pdf")) -> str:
@@ -174,41 +190,37 @@ def create_text_from_column(
     txt_name_column: str,
     replace_all: bool = False,
 ):
-    """
-    Converts PDFs to plain text and stores them in a ZIP archive.
-    Skips any file that already exists in the ZIP.
+    existing = _ensure_zip(zip_path)
+    suffix = f"_{method}.txt"
 
-    Args:
-        df (pd.DataFrame): Input DataFrame.
-        url_column (str): Column with PDF URLs.
-        method (str): Conversion method to use in `convert_pdf_to_txt`.
-        zip_path (Path): Path to a ZIP file to cache/load text files.
-        txt_name_column (str): Column used for naming .txt files in the ZIP.
-        replace_all (bool, optional): If True, replaces existing files in the ZIP. Defaults to False.
-    """
-    existing_zip_names = set()
-    if Path(zip_path).exists():
-        with zipfile.ZipFile(zip_path, mode="r") as zf:
-            existing_zip_names = set(zf.namelist())
-    else:
-        logging.error(f"⚠️ ZIP file {zip_path} does not exist. Creating a new one.")
-        zip_path.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path, mode="w") as zf:
-            pass
+    valid = df[[txt_name_column, url_column]].dropna()
+    valid = valid[valid[url_column].astype(str).str.len() > 0]
 
-    progress_bar = tqdm(total=len(df), desc=f"Text ({method})", dynamic_ncols=True)
-    for idx, row in df.iterrows():
-        filename = f"{safe_filename(row[txt_name_column])}_{method}.txt"
-        if replace_all or filename not in existing_zip_names:
-            text = convert_pdf_to_txt(row[url_column], method)
-            if text.strip():
-                try:
-                    replace_in_zip(Path(zip_path), filename, text)
-                    existing_zip_names.add(filename)
-                except Exception as e:
-                    logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
+    filenames = _build_filenames(valid[txt_name_column], suffix)
+    valid = valid.assign(__filename=filenames)
+
+    if not replace_all:
+        valid = valid[~valid["__filename"].isin(existing)]
+
+    valid = valid.drop_duplicates(subset="__filename", keep="first")
+
+    if valid.empty:
+        logging.info("Nothing to do: all text files already present.")
+        return
+
+    progress_bar = tqdm(total=len(valid), desc=f"Text ({method})", dynamic_ncols=True)
+
+    for row in valid[[url_column, "__filename"]].itertuples(index=False, name=None):
+        url, filename = row
+        text = convert_pdf_to_txt(url, method)
+        if text.strip():
+            try:
+                replace_in_zip(Path(zip_path), filename, text)
+                existing.add(filename)
+            except Exception as e:
+                logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
         progress_bar.update(1)
-        tqdm.write(f"[{idx + 1}/{len(df)}] Text created: {filename}")
-    progress_bar.close()
+        tqdm.write(f"Text created: {filename}")
 
-    logging.info(f"Processed {len(df)} rows for text conversion using method '{method}'")
+    progress_bar.close()
+    logging.info(f"Processed {len(valid)} rows for text conversion using '{method}'")
