@@ -50,6 +50,24 @@ def _build_filenames(series: pd.Series, suffix: str) -> pd.Series:
     return series.astype(str).map(safe_filename) + suffix
 
 
+def unzip_to_folder(zip_path: Path, target_dir: Path, overwrite: bool = False):
+    """
+    Extracts a ZIP to a normal folder.
+
+    Args:
+        zip_path (Path): Path to the ZIP file.
+        target_dir (Path): Directory where contents will be extracted.
+        overwrite (bool): If True, overwrite existing files.
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        for member in zf.namelist():
+            target_file = target_dir / member
+            if not overwrite and target_file.exists():
+                continue
+            zf.extract(member, target_dir)
+
+
 def convert_pdf_to_md(pdf_url: str, method: str, pdf_path: Path = Path("temp.pdf")) -> str:
     """
     Downloads a PDF from a URL and converts it to Markdown using the specified conversion method.
@@ -140,6 +158,9 @@ def create_markdown_from_column(
     progress_bar.close()
     logging.info(f"Processed {len(valid)} rows for Markdown conversion using '{method}'")
 
+    logging.info(f"Unzipping {zip_path} to {zip_path.with_suffix('')}")
+    unzip_to_folder(zip_path, zip_path.with_suffix(""), overwrite=True)
+
 
 def convert_pdf_to_txt(pdf_url: str, method: str, pdf_path: Path = Path("temp.pdf")) -> str:
     """
@@ -224,3 +245,6 @@ def create_text_from_column(
 
     progress_bar.close()
     logging.info(f"Processed {len(valid)} rows for text conversion using '{method}'")
+
+    logging.info(f"Unzipping {zip_path} to {zip_path.with_suffix('')}")
+    unzip_to_folder(zip_path, zip_path.with_suffix(""), overwrite=True)
