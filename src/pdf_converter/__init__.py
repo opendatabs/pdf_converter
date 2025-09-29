@@ -4,10 +4,10 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
-from tqdm import tqdm
 
 import pandas as pd
 import requests
+from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONVERT_SCRIPT_MD = SCRIPT_DIR / "convert_single_pdf2md.py"

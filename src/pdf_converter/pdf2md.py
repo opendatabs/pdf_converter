@@ -1,5 +1,7 @@
 import base64
 import io
+import json
+import mimetypes
 import os
 import re
 import shutil
@@ -10,12 +12,19 @@ from pathlib import Path
 import fitz  # PyMuPDF
 import pdfplumber
 import pymupdf4llm
+import requests
 from docling.document_converter import DocumentConverter
+from dotenv import load_dotenv
 from PIL import Image
+
+load_dotenv()
 
 IMAGE_FOLDER = Path("./images")
 if not IMAGE_FOLDER.exists():
     IMAGE_FOLDER.mkdir()
+
+DOCLING_HTTP_CLIENT = os.getenv("DOCLING_HTTP_CLIENT")
+DOCLING_API_KEY = os.getenv("DOCLING_API_KEY")
 
 
 class Converter:
@@ -245,12 +254,144 @@ class Converter:
             return href
         return None
 
+    def docling_serve_conversion(
+        self,
+        *,
+        to_formats=("md",),  # Markdown
+        image_export_mode="embedded",  # Embedded images
+        pipeline="standard",  # Standard
+        do_ocr=True,  # Enable OCR
+        force_ocr=False,  # Force OCR off
+        ocr_engine="easyocr",  # EasyOCR
+        ocr_lang=("en", "fr", "de", "it"),  # beware-of-format -> we send JSON array
+        pdf_backend="pypdfium2",  # PDF backend
+        table_mode="accurate",  # Accurate
+        abort_on_error=False,  # Abort on error (UI unchecked -> False)
+        return_as_file=False,  # “Return as File” toggle -> ZIP
+        include_images=True,
+        images_scale=2,
+        md_page_break_placeholder="",
+        page_range=None,  # e.g., (1, 10)
+        document_timeout=3600,  # seconds
+        request_timeout=120,  # seconds
+    ):
+        base_url = DOCLING_HTTP_CLIENT
+        if not base_url:
+            raise RuntimeError("DOCLING_HTTP_CLIENT is not set.")
+        url = f"{base_url.rstrip('/')}/v1/convert/file"
+        api_key = DOCLING_API_KEY
+
+        # map pipeline choice to server 'pipeline'
+        pipeline = {"standard": "standard", "vlm": "vlm", "asr": "asr"}[pipeline]
+
+        # target type: inline JSON vs ZIP file
+        target_type = "zip" if return_as_file else "inbody"
+
+        data = {
+            "to_formats": json.dumps(list(to_formats)),
+            "target_type": target_type,
+            "document_timeout": str(int(document_timeout)),
+            "include_images": str(bool(include_images)).lower(),
+            "image_export_mode": image_export_mode,  # embedded | placeholder | referenced
+            "images_scale": str(images_scale),
+            "md_page_break_placeholder": md_page_break_placeholder,
+            "pipeline": pipeline,
+            "do_ocr": str(bool(do_ocr)).lower(),
+            "force_ocr": str(bool(force_ocr)).lower(),
+            "ocr_engine": ocr_engine,  # easyocr | tesseract | rapidocr
+            "ocr_lang": json.dumps(list(ocr_lang)),  # send JSON array to be safe
+            "pdf_backend": pdf_backend,  # pypdfium2 | dlparse_v1/v2/v4
+            "table_mode": table_mode,  # fast | accurate
+            "abort_on_error": str(bool(abort_on_error)).lower(),
+        }
+        if page_range:
+            data["page_range"] = json.dumps([int(page_range[0]), int(page_range[1])])
+
+        mime = mimetypes.guess_type(str(self.input_file))[0] or "application/pdf"
+        files = [("files", (self.input_file.name, open(self.input_file, "rb"), mime))]
+        headers = {"X-Api-Key": DOCLING_API_KEY} if api_key else {}
+
+        resp = requests.post(url, data=data, files=files, headers=headers, timeout=request_timeout)
+        if resp.status_code >= 400:
+            try:
+                detail = resp.json()
+            except Exception:
+                detail = resp.text
+                raise RuntimeError(f"Docling Serve error {resp.status_code}: {detail}")
+
+        ct = resp.headers.get("Content-Type", "")
+
+        # ZIP path (Return as File)
+        if "application/zip" in ct or target_type == "zip":
+            zip_path = self.doc_image_folder.parent / f"{self.output_file.stem}.docling.zip"
+            with open(zip_path, "wb") as f:
+                f.write(resp.content)
+
+            with tempfile.TemporaryDirectory() as td:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    zf.extractall(td)
+
+                # grab markdown
+                md_file = None
+                for root, _, files_in in os.walk(td):
+                    for fn in files_in:
+                        if fn.lower().endswith((".md", ".markdown")):
+                            md_file = Path(root) / fn
+                            break
+                    if md_file:
+                        break
+                if not md_file:
+                    raise RuntimeError("ZIP did not contain a Markdown file.")
+
+                self.md_content = Path(md_file).read_text(encoding="utf-8", errors="replace")
+                self.output_file.write_text(self.md_content, encoding="utf-8")
+
+                # move images to images/<basename>/
+                for root, _, files_in in os.walk(td):
+                    for fn in files_in:
+                        if fn.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")):
+                            dst = self.doc_image_folder / fn
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(Path(root) / fn, dst)
+
+            self.create_image_zip_file = True
+            return self.md_content
+
+        # Inline JSON (inbody)
+        try:
+            payload = resp.json()
+        except Exception:
+            raise RuntimeError("Expected JSON from Docling Serve.")
+        doc = payload.get("document", {}) if isinstance(payload, dict) else {}
+        md = doc.get("content") or doc.get("md") or (doc.get("outputs", {}) or {}).get("md")
+        if not isinstance(md, str) or not md.strip():
+            raise RuntimeError("No Markdown found in Docling Serve response.")
+        self.md_content = md
+        return self.md_content
+
     def convert(self):
-        if self.lib.lower() == "docling":
+        lib = self.lib.lower()
+        if lib == "docling":
             self.md_content = self.docling_conversion()
-        elif self.lib.lower() == "pymupdf4llm":
+        elif lib == "docling-serve":
+            # Your tuned defaults from the UI
+            self.md_content = self.docling_serve_conversion(
+                to_formats=("md",),
+                image_export_mode="embedded",
+                pipeline="standard",
+                do_ocr=True,
+                force_ocr=False,
+                ocr_engine="easyocr",
+                ocr_lang=("en", "fr", "de", "it"),
+                pdf_backend="pypdfium2",
+                table_mode="accurate",
+                abort_on_error=False,
+                return_as_file=False,
+            )
+        elif lib == "pymupdf4llm":
             self.md_content = self.pymupdf4llm_conversion()
         else:
             self.md_content = self.pymupdf_conversion()
-        with open(self.output_file, "w") as f:
+
+        with open(self.output_file, "w", encoding="utf-8") as f:
             f.write(self.md_content)
