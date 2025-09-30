@@ -214,6 +214,7 @@ class Converter:
                 with httpx.Client(timeout=request_timeout) as client:
                     response = client.post(
                         url,
+                        headers=headers,
                         files=files,
                         data=data,
                     )
@@ -222,7 +223,7 @@ class Converter:
                     logging.error(
                         f"Failed to convert document {self.input_file}: {response.status_code} - {response.text}"
                     )
-                    return None
+                    return ""
 
                 result: dict[str, str | dict[str, str]] = response.json()
                 if result.get("status") == "success" and "document" in result:
@@ -231,16 +232,16 @@ class Converter:
                         return document.get("md_content", "")
                     else:
                         logging.error(f"Failed to convert document {self.input_file}: {document}")
-                        return None
+                        return ""
                 else:
                     logging.error(
                         f"Failed to convert document {self.input_file}: {result.get('status')}. \n Errors: {result.get('errors')}"
                     )
-                    return None
+                    return ""
 
         except Exception:
             logging.exception(f"Error converting document {self.input_file} via API.")
-            return None
+            return ""
 
     def pymupdf4llm_conversion(self):
         """Convert PDF to markdown using pymupdf4llm"""
