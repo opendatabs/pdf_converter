@@ -191,7 +191,6 @@ class Converter:
             raise RuntimeError("DOCLING_API_KEY is not set.")
 
         data = {
-            "files": files,
             "to_formats": json.dumps(list(to_formats)),
             "target_type": target_type,
             "document_timeout": str(int(document_timeout)),
