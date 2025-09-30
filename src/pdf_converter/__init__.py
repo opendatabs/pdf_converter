@@ -45,6 +45,7 @@ def _ensure_zip(zip_path: Path) -> set[str]:
         pass
     return set()
 
+
 def _build_filenames(series: pd.Series, suffix: str) -> pd.Series:
     # Vectorized safe filenames
     return series.astype(str).map(safe_filename) + suffix
@@ -60,7 +61,7 @@ def unzip_to_folder(zip_path: Path, target_dir: Path, overwrite: bool = False):
         overwrite (bool): If True, overwrite existing files.
     """
     target_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, 'r') as zf:
+    with zipfile.ZipFile(zip_path, "r") as zf:
         for member in zf.namelist():
             target_file = target_dir / member
             if not overwrite and target_file.exists():

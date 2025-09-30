@@ -1,7 +1,7 @@
 import base64
 import io
 import json
-import mimetypes
+import logging
 import os
 import re
 import shutil
@@ -38,10 +38,8 @@ class Converter:
         self.md_content = ""
         self.create_image_zip_file = False
 
-
     def has_image_extraction(self):
         return self.lib.lower() in ["mistral-ocr"]
-
 
     def extract_images_from_pdf(self):
         pdf_document = fitz.open(self.input_file)
@@ -59,12 +57,11 @@ class Converter:
                     image = Image.open(io.BytesIO(image_bytes))
                     # Save the image
                     image_path = self.doc_image_folder / f"img_{img_index}.png"
-                    print(image_path.name)
+                    logging(image_path.name)
                     image.save(image_path)
                 except Exception as e:
-                    print(f"Error extracting image: {str(e)}")
+                    logging(f"Error extracting image: {str(e)}")
                 img_index += 1
-
 
     def pymupdf_conversion(self):
         """Convert PDF to markdown using PyMuPDF (fitz) for text extraction and custom formatting"""
@@ -156,7 +153,6 @@ class Converter:
         md_content = re.sub(r"\n{3,}", "\n\n", md_content)
         return md_content
 
-
     def docling_serve_conversion(
         self,
         *,
@@ -209,7 +205,7 @@ class Converter:
         }
         if page_range:
             data["page_range"] = json.dumps([int(page_range[0]), int(page_range[1])])
-        
+
         try:
             with open(self.input_file, "rb") as f:
                 files = {"files": (os.path.basename(self.input_file), f, "application/pdf")}
@@ -223,7 +219,9 @@ class Converter:
                 )
 
                 if response.status_code != 200:
-                    self.logger.error(f"Failed to convert document {self.input_file}: {response.status_code} - {response.text}")
+                    logging.error(
+                        f"Failed to convert document {self.input_file}: {response.status_code} - {response.text}"
+                    )
                     return None
 
                 result: dict[str, str | dict[str, str]] = response.json()
@@ -232,18 +230,17 @@ class Converter:
                     if isinstance(document, dict):
                         return document.get("md_content", "")
                     else:
-                        self.logger.error(f"Failed to convert document {self.input_file}: {document}")
+                        logging.error(f"Failed to convert document {self.input_file}: {document}")
                         return None
                 else:
-                    self.logger.error(
-                        f"Failed to convert document {self.input_file}: {result.get("status")}. \n Errors: {result.get("errors")}"
+                    logging.error(
+                        f"Failed to convert document {self.input_file}: {result.get('status')}. \n Errors: {result.get('errors')}"
                     )
                     return None
 
         except Exception:
-            self.logger.exception(f"Error converting document {self.input_file} via API.")
+            logging.exception(f"Error converting document {self.input_file} via API.")
             return None
-
 
     def pymupdf4llm_conversion(self):
         """Convert PDF to markdown using pymupdf4llm"""
@@ -251,9 +248,8 @@ class Converter:
             md_content = pymupdf4llm.to_markdown(self.input_file)
             return md_content
         except Exception as e:
-            print(f"pymupdf4llm conversion error: {str(e)}")
+            logging(f"pymupdf4llm conversion error: {str(e)}")
             return f"Conversion with pymupdf4llm failed: {str(e)}"
-
 
     def docling_conversion(self):
         """Convert PDF to markdown using docling"""
@@ -264,9 +260,8 @@ class Converter:
             return md_content
 
         except Exception as e:
-            print(f"docling conversion error: {str(e)}")
+            logging(f"docling conversion error: {str(e)}")
             return f"Conversion with docling failed: {str(e)}"
-
 
     def pdfplumber_conversion(self):
         """Extracts text with headings and tables from a PDF while maintaining structure."""
@@ -307,7 +302,6 @@ class Converter:
                 structured_text.append("\n---\n")  # Page separator
         return "\n".join(structured_text)
 
-
     def zip_markdown_doc_with_images(self):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp_zip_file:
             temp_zip_path = Path(tmp_zip_file.name)  # Get the temp file path
@@ -325,11 +319,9 @@ class Converter:
                         zipf.write(file_path, Path("images") / file)
         return Path(temp_zip_path)
 
-
     def get_zipped_images(self):
         shutil.make_archive(self.doc_image_folder, "zip", self.doc_image_folder)
         return f"{self.doc_image_folder}.zip"
-
 
     def get_file_download_link(self, link_text: str):
         """Generate a download link for an existing file"""
@@ -350,7 +342,6 @@ class Converter:
             href = f'<a href="data:file/{mime_type};base64,{b64}" download="{filename}">{link_text}</a>'
             return href
         return None
-
 
     def convert(self):
         lib = self.lib.lower()
