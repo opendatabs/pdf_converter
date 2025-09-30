@@ -279,49 +279,50 @@ class Converter:
         if not base_url:
             raise RuntimeError("DOCLING_HTTP_CLIENT is not set.")
         url = f"{base_url.rstrip('/')}/v1/convert/file"
-        api_key = DOCLING_API_KEY
-
-        # map pipeline choice to server 'pipeline'
-        pipeline = {"standard": "standard", "vlm": "vlm", "asr": "asr"}[pipeline]
 
         # target type: inline JSON vs ZIP file
         target_type = "zip" if return_as_file else "inbody"
 
-        data = {
-            "to_formats": json.dumps(list(to_formats)),
-            "target_type": target_type,
-            "document_timeout": str(int(document_timeout)),
-            "include_images": str(bool(include_images)).lower(),
-            "image_export_mode": image_export_mode,  # embedded | placeholder | referenced
-            "images_scale": str(images_scale),
-            "md_page_break_placeholder": md_page_break_placeholder,
-            "pipeline": pipeline,
-            "do_ocr": str(bool(do_ocr)).lower(),
-            "force_ocr": str(bool(force_ocr)).lower(),
-            "ocr_engine": ocr_engine,  # easyocr | tesseract | rapidocr
-            "ocr_lang": json.dumps(list(ocr_lang)),  # send JSON array to be safe
-            "pdf_backend": pdf_backend,  # pypdfium2 | dlparse_v1/v2/v4
-            "table_mode": table_mode,  # fast | accurate
-            "abort_on_error": str(bool(abort_on_error)).lower(),
-        }
-        if page_range:
-            data["page_range"] = json.dumps([int(page_range[0]), int(page_range[1])])
+        with open(self.input_file, "rb") as f:
+            files = [
+                ("files", (self.input_file, f, "application/pdf"))
+            ]
 
-        mime = mimetypes.guess_type(str(self.input_file))[0] or "application/pdf"
-        files = [("files", (self.input_file.name, open(self.input_file, "rb"), mime))]
-        headers = {"Authorization": DOCLING_API_KEY}
-        if not api_key:
-            raise RuntimeError("DOCLING_API_KEY is not set.")
+            data = {
+                "files": files,
+                "to_formats": json.dumps(list(to_formats)),
+                "target_type": target_type,
+                "document_timeout": str(int(document_timeout)),
+                "include_images": str(bool(include_images)).lower(),
+                "image_export_mode": image_export_mode,  # embedded | placeholder | referenced
+                "images_scale": str(images_scale),
+                "md_page_break_placeholder": md_page_break_placeholder,
+                "pipeline": pipeline,
+                "do_ocr": str(bool(do_ocr)).lower(),
+                "force_ocr": str(bool(force_ocr)).lower(),
+                "ocr_engine": ocr_engine,  # easyocr | tesseract | rapidocr
+                "ocr_lang": json.dumps(list(ocr_lang)),  # send JSON array to be safe
+                "pdf_backend": pdf_backend,  # pypdfium2 | dlparse_v1/v2/v4
+                "table_mode": table_mode,  # fast | accurate
+                "abort_on_error": str(bool(abort_on_error)).lower(),
+            }
+            if page_range:
+                data["page_range"] = json.dumps([int(page_range[0]), int(page_range[1])])
 
-        resp = requests.post(url, data=data, files=files, headers=headers, timeout=request_timeout)
-        if resp.status_code >= 400:
-            try:
-                detail = resp.json()
-            except Exception:
-                detail = resp.text
-                raise RuntimeError(f"Docling Serve error {resp.status_code}: {detail}")
+            headers = {"Authorization": DOCLING_API_KEY}
+            if not DOCLING_API_KEY:
+                raise RuntimeError("DOCLING_API_KEY is not set.")
 
-        ct = resp.headers.get("Content-Type", "")
+            resp = requests.post(url, data=data, headers=headers, timeout=request_timeout)
+
+            if resp.status_code >= 400:
+                try:
+                    detail = resp.json()
+                except Exception:
+                    detail = resp.text
+                    raise RuntimeError(f"Docling Serve error {resp.status_code}: {detail}")
+
+            ct = resp.headers.get("Content-Type", "")
 
         # ZIP path (Return as File)
         if "application/zip" in ct or target_type == "zip":
