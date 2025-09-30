@@ -309,7 +309,9 @@ class Converter:
 
         mime = mimetypes.guess_type(str(self.input_file))[0] or "application/pdf"
         files = [("files", (self.input_file.name, open(self.input_file, "rb"), mime))]
-        headers = {"X-Api-Key": DOCLING_API_KEY} if api_key else {}
+        headers = {"Authorization": DOCLING_API_KEY}
+        if not api_key:
+            raise RuntimeError("DOCLING_API_KEY is not set.")
 
         resp = requests.post(url, data=data, files=files, headers=headers, timeout=request_timeout)
         if resp.status_code >= 400:
