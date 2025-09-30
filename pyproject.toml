@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "docling>=2.30.0",
+    "httpx>=0.28.1",
     "markdown>=3.8",
     "pdfkit>=1.0.0",
     "pdfplumber>=0.11.6",

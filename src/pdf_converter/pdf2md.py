@@ -10,6 +10,7 @@ import zipfile
 from pathlib import Path
 
 import fitz  # PyMuPDF
+import httpx
 import pdfplumber
 import pymupdf4llm
 import requests
@@ -210,13 +211,12 @@ class Converter:
             with open(self.input_file, "rb") as f:
                 files = {"files": (os.path.basename(self.input_file), f, "application/pdf")}
 
-                response = requests.post(
-                    url,
-                    data=data,
-                    files=files,
-                    headers=headers,
-                    timeout=request_timeout,
-                )
+                with httpx.Client(timeout=request_timeout) as client:
+                    response = client.post(
+                        url,
+                        files=files,
+                        data=data,
+                    )
 
                 if response.status_code != 200:
                     logging.error(
