@@ -21,7 +21,7 @@ def safe_filename(name):
     return re.sub(r"[^a-zA-Z0-9_\-.]", "_", name)
 
 
-def replace_in_zip(zip_path, filename, content):
+def replace_in_zip(zip_path: Path, filename: str, content: bytes):
     temp_zip_path = zip_path.with_suffix(".tmp.zip")
     with (
         zipfile.ZipFile(zip_path, "r") as zf_in,
@@ -144,17 +144,24 @@ def create_markdown_from_column(
     progress_bar = tqdm(total=len(valid), desc=f"Markdown ({method})", dynamic_ncols=True)
 
     # Iterate only filtered rows, use itertuples for speed
-    for row in valid[[url_column, "__filename"]].itertuples(index=False, name=None):
+    for url, filename in valid[[url_column, "__filename"]].itertuples(index=False, name=None):
         url, filename = row
         markdown = convert_pdf_to_md(url, method)
-        if markdown.strip():
-            try:
-                replace_in_zip(Path(zip_path), filename, markdown)
-                existing.add(filename)
-            except Exception as e:
-                logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
-        progress_bar.update(1)
-        tqdm.write(f"Markdown created: {filename}")
+    
+        if not markdown or not markdown.strip():
+            logging.warning(f"⚠️ No markdown produced for {filename} (url={url}). Skipping.")
+            progress_bar.update(1)
+            continue
+    
+        try:
+            # be explicit about encoding
+            replace_in_zip(Path(zip_path), filename, markdown.encode("utf-8"))
+            existing.add(filename)
+            tqdm.write(f"✅ wrote {filename} ({len(markdown)} chars)")
+        except Exception as e:
+            logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
+        finally:
+            progress_bar.update(1)
 
     progress_bar.close()
     logging.info(f"Processed {len(valid)} rows for Markdown conversion using '{method}'")
