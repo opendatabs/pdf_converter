@@ -145,7 +145,6 @@ def create_markdown_from_column(
 
     # Iterate only filtered rows, use itertuples for speed
     for url, filename in valid[[url_column, "__filename"]].itertuples(index=False, name=None):
-        url, filename = row
         markdown = convert_pdf_to_md(url, method)
     
         if not markdown or not markdown.strip():
