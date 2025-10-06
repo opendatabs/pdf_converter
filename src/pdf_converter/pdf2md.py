@@ -217,6 +217,7 @@ class Converter:
                         headers=headers,
                         files=files,
                         data=data,
+                        verify=False,
                     )
 
                 if response.status_code != 200:
