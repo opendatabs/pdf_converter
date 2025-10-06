@@ -207,41 +207,36 @@ class Converter:
         if page_range:
             data["page_range"] = json.dumps([int(page_range[0]), int(page_range[1])])
 
-        try:
-            with open(self.input_file, "rb") as f:
-                files = {"files": (os.path.basename(self.input_file), f, "application/pdf")}
+        with open(self.input_file, "rb") as f:
+            files = {"files": (os.path.basename(self.input_file), f, "application/pdf")}
 
-                with httpx.Client(verify=False, timeout=request_timeout) as client:
-                    response = client.post(
-                        url,
-                        headers=headers,
-                        files=files,
-                        data=data,
-                    )
+            with httpx.Client(timeout=request_timeout) as client:
+                response = client.post(
+                    url,
+                    headers=headers,
+                    files=files,
+                    data=data,
+                )
 
-                if response.status_code != 200:
-                    logging.error(
-                        f"Failed to convert document {self.input_file}: {response.status_code} - {response.text}"
-                    )
-                    return None
+            if response.status_code != 200:
+                logging.error(
+                    f"Failed to convert document {self.input_file}: {response.status_code} - {response.text}"
+                )
+                return None
 
-                result: dict[str, str | dict[str, str]] = response.json()
-                if result.get("status") == "success" and "document" in result:
-                    document: str | dict[str, str] = result["document"]
-                    if isinstance(document, dict):
-                        return document.get("md_content", "")
-                    else:
-                        logging.error(f"Failed to convert document {self.input_file}: {document}")
-                        return None
+            result: dict[str, str | dict[str, str]] = response.json()
+            if result.get("status") == "success" and "document" in result:
+                document: str | dict[str, str] = result["document"]
+                if isinstance(document, dict):
+                    return document.get("md_content", "")
                 else:
-                    logging.error(
-                        f"Failed to convert document {self.input_file}: {result.get('status')}. \n Errors: {result.get('errors')}"
-                    )
+                    logging.error(f"Failed to convert document {self.input_file}: {document}")
                     return None
-
-        except Exception:
-            logging.exception(f"Error converting document {self.input_file} via API.")
-            return None
+            else:
+                logging.error(
+                    f"Failed to convert document {self.input_file}: {result.get('status')}. \n Errors: {result.get('errors')}"
+                )
+                return None
 
     def pymupdf4llm_conversion(self):
         """Convert PDF to markdown using pymupdf4llm"""
