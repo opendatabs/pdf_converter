@@ -183,7 +183,7 @@ class Converter:
         # target type: inline JSON vs ZIP file
         target_type = "zip" if return_as_file else "inbody"
 
-        headers = {"Authorization": f"{DOCLING_API_KEY}"}
+        headers = {"Authorization": f"Bearer {DOCLING_API_KEY}"}
         if not DOCLING_API_KEY:
             raise RuntimeError("DOCLING_API_KEY is not set.")
 
