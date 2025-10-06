@@ -211,13 +211,12 @@ class Converter:
             with open(self.input_file, "rb") as f:
                 files = {"files": (os.path.basename(self.input_file), f, "application/pdf")}
 
-                with httpx.Client(timeout=request_timeout) as client:
+                with httpx.Client(verify=False, timeout=request_timeout) as client:
                     response = client.post(
                         url,
                         headers=headers,
                         files=files,
                         data=data,
-                        verify=False,
                     )
 
                 if response.status_code != 200:
