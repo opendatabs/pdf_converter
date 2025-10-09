@@ -188,7 +188,7 @@ class Converter:
             raise RuntimeError("DOCLING_API_KEY is not set.")
 
         data = {
-            "to_formats": json.dumps(list(to_formats)),
+            "to_formats": list(to_formats),
             "target_type": target_type,
             "document_timeout": str(int(document_timeout)),
             "include_images": str(bool(include_images)).lower(),
@@ -199,7 +199,7 @@ class Converter:
             "do_ocr": str(bool(do_ocr)).lower(),
             "force_ocr": str(bool(force_ocr)).lower(),
             "ocr_engine": ocr_engine,  # easyocr | tesseract | rapidocr
-            "ocr_lang": json.dumps(list(ocr_lang)),  # send JSON array to be safe
+            "ocr_lang": list(ocr_lang),  # send JSON array to be safe
             "pdf_backend": pdf_backend,  # pypdfium2 | dlparse_v1/v2/v4
             "table_mode": table_mode,  # fast | accurate
             "abort_on_error": str(bool(abort_on_error)).lower(),
@@ -210,7 +210,7 @@ class Converter:
         with open(self.input_file, "rb") as f:
             files = {"files": (os.path.basename(self.input_file), f, "application/pdf")}
 
-            with httpx.Client(timeout=request_timeout) as client:
+            with httpx.Client(verify=False, timeout=request_timeout) as client:
                 response = client.post(
                     url,
                     headers=headers,
