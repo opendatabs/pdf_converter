@@ -157,13 +157,13 @@ class Converter:
     def docling_serve_conversion(
         self,
         *,
-        to_formats=("md",),  # Markdown
+        to_formats=["md"],  # Markdown
         image_export_mode="embedded",  # Embedded images
         pipeline="standard",  # Standard
         do_ocr=True,  # Enable OCR
         force_ocr=False,  # Force OCR off
         ocr_engine="easyocr",  # EasyOCR
-        ocr_lang=("en", "fr", "de", "it"),  # beware-of-format -> we send JSON array
+        ocr_lang=["en", "fr", "de", "it"], 
         pdf_backend="pypdfium2",  # PDF backend
         table_mode="accurate",  # Accurate
         abort_on_error=False,  # Abort on error (UI unchecked -> False)
@@ -171,7 +171,7 @@ class Converter:
         include_images=True,
         images_scale=2,
         md_page_break_placeholder="",
-        page_range=None,  # e.g., (1, 10)
+        page_range=None,  # e.g., [1, 10]
         document_timeout=3600,  # seconds
         request_timeout=120,  # seconds
     ):
@@ -188,24 +188,24 @@ class Converter:
             raise RuntimeError("DOCLING_API_KEY is not set.")
 
         data = {
-            "to_formats": list(to_formats),
+            "to_formats": to_formats,
             "target_type": target_type,
-            "document_timeout": str(int(document_timeout)),
-            "include_images": str(bool(include_images)).lower(),
+            "document_timeout": document_timeout,
+            "include_images": include_images,
             "image_export_mode": image_export_mode,  # embedded | placeholder | referenced
-            "images_scale": str(images_scale),
+            "images_scale": images_scale,
             "md_page_break_placeholder": md_page_break_placeholder,
             "pipeline": pipeline,
-            "do_ocr": str(bool(do_ocr)).lower(),
-            "force_ocr": str(bool(force_ocr)).lower(),
+            "do_ocr": do_ocr,
+            "force_ocr": force_ocr,
             "ocr_engine": ocr_engine,  # easyocr | tesseract | rapidocr
-            "ocr_lang": list(ocr_lang),  # send JSON array to be safe
+            "ocr_lang": ocr_lang,  # send JSON array to be safe
             "pdf_backend": pdf_backend,  # pypdfium2 | dlparse_v1/v2/v4
             "table_mode": table_mode,  # fast | accurate
-            "abort_on_error": str(bool(abort_on_error)).lower(),
+            "abort_on_error": abort_on_error,
         }
         if page_range:
-            data["page_range"] = json.dumps([int(page_range[0]), int(page_range[1])])
+            data["page_range"] = page_range
 
         with open(self.input_file, "rb") as f:
             files = {"files": (os.path.basename(self.input_file), f, "application/pdf")}
@@ -346,13 +346,13 @@ class Converter:
         elif lib == "docling-serve":
             # Your tuned defaults from the UI
             self.md_content = self.docling_serve_conversion(
-                to_formats=("md",),
+                to_formats=["md"],
                 image_export_mode="embedded",
                 pipeline="standard",
                 do_ocr=True,
                 force_ocr=False,
                 ocr_engine="easyocr",
-                ocr_lang=("en", "fr", "de", "it"),
+                ocr_lang=["en", "fr", "de", "it"],
                 pdf_backend="pypdfium2",
                 table_mode="accurate",
                 abort_on_error=False,
