@@ -1,9 +1,13 @@
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import zipfile
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -139,6 +143,75 @@ def _prepare_batch_rows(
     return valid
 
 
+def _handle_conversion_result(
+    content: str,
+    filename: str,
+    zip_path: Path,
+    existing: set[str],
+    failures: dict[str, int],
+    max_failures: int | None,
+    label: str,
+) -> bool:
+    """Write successful content to the zip; update failure counts. Returns True if written."""
+    wrote = False
+    if content.strip():
+        try:
+            replace_in_zip(zip_path, filename, content)
+            existing.add(filename)
+            wrote = True
+            if max_failures is not None:
+                _clear_failure(failures, zip_path, filename)
+        except Exception as e:
+            logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
+
+    if not wrote and max_failures is not None:
+        _record_failure(failures, zip_path, filename, max_failures)
+
+    if wrote:
+        tqdm.write(f"{label} created: {filename}")
+    return wrote
+
+
+def _run_batch_conversions(
+    rows: Iterable[tuple[str, str]],
+    convert_fn: Callable[..., str],
+    method: str,
+    zip_path: Path,
+    existing: set[str],
+    failures: dict[str, int],
+    max_failures: int | None,
+    max_workers: int,
+    label: str,
+) -> None:
+    """Convert rows; write to zip and update failures on the main thread."""
+    row_list = list(rows)
+    if not row_list:
+        return
+
+    progress_bar = tqdm(total=len(row_list), desc=f"{label} ({method})", dynamic_ncols=True)
+    workers = max(1, max_workers)
+
+    if workers == 1:
+        for url, filename in row_list:
+            content = convert_fn(url, method)
+            _handle_conversion_result(content, filename, zip_path, existing, failures, max_failures, label)
+            progress_bar.update(1)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_filename = {executor.submit(convert_fn, url, method): filename for url, filename in row_list}
+            for future in as_completed(future_to_filename):
+                filename = future_to_filename[future]
+                try:
+                    content = future.result()
+                except Exception as e:
+                    logging.error(f"Unexpected conversion error for {filename}: {e}")
+                    content = ""
+                _handle_conversion_result(content, filename, zip_path, existing, failures, max_failures, label)
+                progress_bar.update(1)
+
+    progress_bar.close()
+
+
 def unzip_to_folder(zip_path: Path, target_dir: Path, overwrite: bool = False):
     """
     Extracts a ZIP to a normal folder.
@@ -157,46 +230,58 @@ def unzip_to_folder(zip_path: Path, target_dir: Path, overwrite: bool = False):
             zf.extract(member, target_dir)
 
 
-def convert_pdf_to_md(pdf_url: str, method: str, pdf_path: Path = Path("temp.pdf")) -> str:
+def convert_pdf_to_md(pdf_url: str, method: str, pdf_path: Path | None = None) -> str:
     """
     Downloads a PDF from a URL and converts it to Markdown using the specified conversion method.
 
     Args:
         pdf_url (str): The URL of the PDF to download.
         method (str): The conversion method to use (e.g. 'poppler', 'pdf2text').
-        pdf_path (Path, optional): Path to save the downloaded PDF. Defaults to 'temp.pdf'.
+        pdf_path (Path, optional): Path to save the downloaded PDF. If omitted, a unique
+            temporary file is created and removed after conversion.
 
     Returns:
-        str: The Markdown content as a string, or an error message if the process fails.
+        str: The Markdown content as a string, or an empty string if the process fails.
     """
-    logging.info(f"Downloading PDF: {pdf_url}")
-    try:
-        r_pdf = requests.get(pdf_url, timeout=10)
-        r_pdf.raise_for_status()
-        with open(pdf_path, "wb") as file:
-            file.write(r_pdf.content)
-    except Exception as e:
-        logging.error(f"Failed to download PDF: {e}")
-        return ""
+    own_temp = pdf_path is None
+    if own_temp:
+        fd, temp_name = tempfile.mkstemp(suffix=".pdf")
+        # Close the low-level fd; we reopen via Path for writing.
+        os.close(fd)
+        pdf_path = Path(temp_name)
 
-    # Subprocess for crash isolation
     try:
-        result = subprocess.run(
-            [sys.executable, str(CONVERT_SCRIPT_MD), str(pdf_path), method],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode != 0:
-            logging.error(f"[ERROR] Subprocess failed: {result.stderr}")
+        logging.info(f"Downloading PDF: {pdf_url}")
+        try:
+            r_pdf = requests.get(pdf_url, timeout=10)
+            r_pdf.raise_for_status()
+            with open(pdf_path, "wb") as file:
+                file.write(r_pdf.content)
+        except Exception as e:
+            logging.error(f"Failed to download PDF: {e}")
             return ""
-        return result.stdout
-    except subprocess.TimeoutExpired:
-        logging.error("Conversion timed out.")
-        return ""
-    except Exception as e:
-        logging.error(f"Unexpected error in subprocess: {e}")
-        return ""
+
+        # Subprocess for crash isolation
+        try:
+            result = subprocess.run(
+                [sys.executable, str(CONVERT_SCRIPT_MD), str(pdf_path), method],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                logging.error(f"[ERROR] Subprocess failed: {result.stderr}")
+                return ""
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            logging.error("Conversion timed out.")
+            return ""
+        except Exception as e:
+            logging.error(f"Unexpected error in subprocess: {e}")
+            return ""
+    finally:
+        if own_temp and pdf_path is not None:
+            pdf_path.unlink(missing_ok=True)
 
 
 def create_markdown_from_column(
@@ -208,6 +293,7 @@ def create_markdown_from_column(
     replace_all: bool = False,
     max_failures: int | None = None,
     shuffle: bool = False,
+    max_workers: int = 1,
 ):
     """
     Convert PDFs referenced in a DataFrame column to Markdown and store them in a zip.
@@ -229,6 +315,8 @@ def create_markdown_from_column(
         shuffle: If True, shuffle remaining work after filtering existing files and
             exhausted failures. Helps with transient / rate-limit failures by trying
             documents in a different order each run.
+        max_workers: Number of parallel conversions (default 1 = sequential). Useful for
+            ``docling-serve``; start with 2–4 and raise carefully.
     """
     zip_path = Path(zip_path)
     existing = _ensure_zip(zip_path)
@@ -253,75 +341,73 @@ def create_markdown_from_column(
         logging.info("Nothing to do: all Markdown files already present.")
         return
 
-    progress_bar = tqdm(total=len(valid), desc=f"Markdown ({method})", dynamic_ncols=True)
-
-    for row in valid[[url_column, "__filename"]].itertuples(index=False, name=None):
-        url, filename = row
-        markdown = convert_pdf_to_md(url, method)
-        wrote = False
-        if markdown.strip():
-            try:
-                replace_in_zip(zip_path, filename, markdown)
-                existing.add(filename)
-                wrote = True
-                if max_failures is not None:
-                    _clear_failure(failures, zip_path, filename)
-            except Exception as e:
-                logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
-
-        if not wrote and max_failures is not None:
-            _record_failure(failures, zip_path, filename, max_failures)
-
-        progress_bar.update(1)
-        if wrote:
-            tqdm.write(f"Markdown created: {filename}")
-
-    progress_bar.close()
+    _run_batch_conversions(
+        valid[[url_column, "__filename"]].itertuples(index=False, name=None),
+        convert_pdf_to_md,
+        method,
+        zip_path,
+        existing,
+        failures,
+        max_failures,
+        max_workers,
+        "Markdown",
+    )
     logging.info(f"Processed {len(valid)} rows for Markdown conversion using '{method}'")
 
     logging.info(f"Unzipping {zip_path} to {zip_path.with_suffix('')}")
     unzip_to_folder(zip_path, zip_path.with_suffix(""), overwrite=True)
 
 
-def convert_pdf_to_txt(pdf_url: str, method: str, pdf_path: Path = Path("temp.pdf")) -> str:
+def convert_pdf_to_txt(pdf_url: str, method: str, pdf_path: Path | None = None) -> str:
     """
     Downloads a PDF from a URL and converts it to plain text using the specified method.
 
     Args:
         pdf_url (str): The URL of the PDF to download.
         method (str): The conversion method to use ('pymupdf', 'pdfplumber', etc.).
-        pdf_path (Path, optional): Path to save the downloaded PDF. Defaults to 'temp.pdf'.
+        pdf_path (Path, optional): Path to save the downloaded PDF. If omitted, a unique
+            temporary file is created and removed after conversion.
 
     Returns:
-        str: The plain text content as a string, or an error message if the process fails.
+        str: The plain text content as a string, or an empty string if the process fails.
     """
-    logging.info(f"Downloading PDF: {pdf_url}")
-    try:
-        r_pdf = requests.get(pdf_url, timeout=10)
-        r_pdf.raise_for_status()
-        with open(pdf_path, "wb") as file:
-            file.write(r_pdf.content)
-    except Exception as e:
-        logging.error(f"Failed to download PDF: {e}")
-        return ""
+    own_temp = pdf_path is None
+    if own_temp:
+        fd, temp_name = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        pdf_path = Path(temp_name)
 
     try:
-        result = subprocess.run(
-            [sys.executable, str(CONVERT_SCRIPT_TXT), str(pdf_path), method],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode != 0:
-            logging.error(f"[ERROR] Subprocess failed: {result.stderr}")
+        logging.info(f"Downloading PDF: {pdf_url}")
+        try:
+            r_pdf = requests.get(pdf_url, timeout=10)
+            r_pdf.raise_for_status()
+            with open(pdf_path, "wb") as file:
+                file.write(r_pdf.content)
+        except Exception as e:
+            logging.error(f"Failed to download PDF: {e}")
             return ""
-        return result.stdout
-    except subprocess.TimeoutExpired:
-        logging.error("Conversion timed out.")
-        return ""
-    except Exception as e:
-        logging.error(f"Unexpected error in subprocess: {e}")
-        return ""
+
+        try:
+            result = subprocess.run(
+                [sys.executable, str(CONVERT_SCRIPT_TXT), str(pdf_path), method],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                logging.error(f"[ERROR] Subprocess failed: {result.stderr}")
+                return ""
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            logging.error("Conversion timed out.")
+            return ""
+        except Exception as e:
+            logging.error(f"Unexpected error in subprocess: {e}")
+            return ""
+    finally:
+        if own_temp and pdf_path is not None:
+            pdf_path.unlink(missing_ok=True)
 
 
 def create_text_from_column(
@@ -333,6 +419,7 @@ def create_text_from_column(
     replace_all: bool = False,
     max_failures: int | None = None,
     shuffle: bool = False,
+    max_workers: int = 1,
 ):
     """
     Convert PDFs referenced in a DataFrame column to plain text and store them in a zip.
@@ -354,6 +441,8 @@ def create_text_from_column(
         shuffle: If True, shuffle remaining work after filtering existing files and
             exhausted failures. Helps with transient / rate-limit failures by trying
             documents in a different order each run.
+        max_workers: Number of parallel conversions (default 1 = sequential). Useful for
+            I/O-bound backends; start with 2–4 and raise carefully.
     """
     zip_path = Path(zip_path)
     existing = _ensure_zip(zip_path)
@@ -378,30 +467,17 @@ def create_text_from_column(
         logging.info("Nothing to do: all text files already present.")
         return
 
-    progress_bar = tqdm(total=len(valid), desc=f"Text ({method})", dynamic_ncols=True)
-
-    for row in valid[[url_column, "__filename"]].itertuples(index=False, name=None):
-        url, filename = row
-        text = convert_pdf_to_txt(url, method)
-        wrote = False
-        if text.strip():
-            try:
-                replace_in_zip(zip_path, filename, text)
-                existing.add(filename)
-                wrote = True
-                if max_failures is not None:
-                    _clear_failure(failures, zip_path, filename)
-            except Exception as e:
-                logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
-
-        if not wrote and max_failures is not None:
-            _record_failure(failures, zip_path, filename, max_failures)
-
-        progress_bar.update(1)
-        if wrote:
-            tqdm.write(f"Text created: {filename}")
-
-    progress_bar.close()
+    _run_batch_conversions(
+        valid[[url_column, "__filename"]].itertuples(index=False, name=None),
+        convert_pdf_to_txt,
+        method,
+        zip_path,
+        existing,
+        failures,
+        max_failures,
+        max_workers,
+        "Text",
+    )
     logging.info(f"Processed {len(valid)} rows for text conversion using '{method}'")
 
     logging.info(f"Unzipping {zip_path} to {zip_path.with_suffix('')}")

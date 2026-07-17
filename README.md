@@ -54,21 +54,23 @@ Optional parameters for long-running / incremental jobs:
 
 - `max_failures: int | None = None` — after a filename has failed this many times across runs (empty output, download or subprocess failure), skip it on later runs. Failure counts are stored next to the zip as `{zip_stem}.failures.json`. A later successful write clears the entry. `None` (default) retries forever.
 - `shuffle: bool = False` — shuffle remaining work after filtering existing files and exhausted failures, so each run tries remaining documents in a different order (helps with transient / rate-limit failures).
+- `max_workers: int = 1` — number of parallel conversions (`1` = sequential). Especially useful with `method="docling-serve"`; start with 2–4 and raise carefully until you know the server’s limit. Zip writes and failure-count updates stay serial.
 
 Example:
 
 ```python
 from pathlib import Path
-from pdf_converter import create_text_from_column
+from pdf_converter import create_markdown_from_column
 
-create_text_from_column(
+create_markdown_from_column(
     df,
     url_column="pdf_url",
-    method="pymupdf",
-    zip_path=Path("output/texts.zip"),
-    txt_name_column="title",
+    method="docling-serve",
+    zip_path=Path("output/markdown.zip"),
+    md_name_column="title",
     max_failures=3,
     shuffle=True,
+    max_workers=4,
 )
 ```
 
