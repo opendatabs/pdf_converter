@@ -46,6 +46,32 @@ pip install "git+https://github.com/opendatabs/pdf_converter@<commit-sha>"
 pip install "git+https://github.com/opendatabs/pdf_converter@main"
 ```
 
+## Bulk conversion helpers
+
+`create_markdown_from_column` and `create_text_from_column` convert PDFs from a DataFrame column into a zip archive. Files already in the zip are skipped unless `replace_all=True`. Only successful (non-blank) conversions are written.
+
+Optional parameters for long-running / incremental jobs:
+
+- `max_failures: int | None = None` — after a filename has failed this many times across runs (empty output, download or subprocess failure), skip it on later runs. Failure counts are stored next to the zip as `{zip_stem}.failures.json`. A later successful write clears the entry. `None` (default) retries forever.
+- `shuffle: bool = False` — shuffle remaining work after filtering existing files and exhausted failures, so each run tries remaining documents in a different order (helps with transient / rate-limit failures).
+
+Example:
+
+```python
+from pathlib import Path
+from pdf_converter import create_text_from_column
+
+create_text_from_column(
+    df,
+    url_column="pdf_url",
+    method="pymupdf",
+    zip_path=Path("output/texts.zip"),
+    txt_name_column="title",
+    max_failures=3,
+    shuffle=True,
+)
+```
+
 ## Development
 
 To work on this package locally:

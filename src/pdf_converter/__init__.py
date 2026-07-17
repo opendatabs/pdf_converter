@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import subprocess
@@ -21,7 +22,7 @@ def safe_filename(name):
     return re.sub(r"[^a-zA-Z0-9_\-.]", "_", name)
 
 
-def replace_in_zip(zip_path: Path, filename: str, content: bytes):
+def replace_in_zip(zip_path, filename, content):
     temp_zip_path = zip_path.with_suffix(".tmp.zip")
     with (
         zipfile.ZipFile(zip_path, "r") as zf_in,
@@ -49,6 +50,93 @@ def _ensure_zip(zip_path: Path) -> set[str]:
 def _build_filenames(series: pd.Series, suffix: str) -> pd.Series:
     # Vectorized safe filenames
     return series.astype(str).map(safe_filename) + suffix
+
+
+def _failures_path(zip_path: Path) -> Path:
+    """Path to the failure-count JSON stored next to the output zip."""
+    return Path(zip_path).with_name(f"{Path(zip_path).stem}.failures.json")
+
+
+def _load_failures(zip_path: Path) -> dict[str, int]:
+    path = _failures_path(zip_path)
+    if not path.exists():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            logging.warning(f"Ignoring invalid failure store {path}: expected a JSON object")
+            return {}
+        return {str(k): int(v) for k, v in data.items()}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+        logging.warning(f"Could not load failure counts from {path}: {e}")
+        return {}
+
+
+def _save_failures(zip_path: Path, failures: dict[str, int]) -> None:
+    path = _failures_path(zip_path)
+    if not failures:
+        if path.exists():
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(failures, f, indent=2, sort_keys=True)
+
+
+def _record_failure(failures: dict[str, int], zip_path: Path, filename: str, max_failures: int) -> None:
+    count = failures.get(filename, 0) + 1
+    failures[filename] = count
+    logging.warning(f"Conversion failed for {filename}: {count}/{max_failures}")
+    _save_failures(zip_path, failures)
+
+
+def _clear_failure(failures: dict[str, int], zip_path: Path, filename: str) -> None:
+    if filename not in failures:
+        return
+    del failures[filename]
+    _save_failures(zip_path, failures)
+
+
+def _prepare_batch_rows(
+    df: pd.DataFrame,
+    name_column: str,
+    url_column: str,
+    suffix: str,
+    existing: set[str],
+    replace_all: bool,
+    failures: dict[str, int],
+    max_failures: int | None,
+    shuffle: bool,
+) -> pd.DataFrame:
+    valid = df[[name_column, url_column]].dropna()
+    valid = valid[valid[url_column].astype(str).str.len() > 0]
+
+    filenames = _build_filenames(valid[name_column], suffix)
+    valid = valid.assign(__filename=filenames)
+
+    if not replace_all:
+        valid = valid[~valid["__filename"].isin(existing)]
+
+    valid = valid.drop_duplicates(subset="__filename", keep="first")
+
+    if max_failures is not None:
+        # Drop stale failure entries for files already present in the zip
+        for name in [n for n in failures if n in existing]:
+            del failures[name]
+
+        exhausted = {name for name, count in failures.items() if count >= max_failures}
+        if exhausted:
+            skipped = valid[valid["__filename"].isin(exhausted)]
+            for filename in skipped["__filename"]:
+                count = failures[filename]
+                logging.info(f"Skipping {filename}: reached max failures ({count}/{max_failures})")
+            valid = valid[~valid["__filename"].isin(exhausted)]
+
+    if shuffle and not valid.empty:
+        valid = valid.sample(frac=1).reset_index(drop=True)
+
+    return valid
 
 
 def unzip_to_folder(zip_path: Path, target_dir: Path, overwrite: bool = False):
@@ -118,24 +206,48 @@ def create_markdown_from_column(
     zip_path: Path,
     md_name_column: str,
     replace_all: bool = False,
+    max_failures: int | None = None,
+    shuffle: bool = False,
 ):
+    """
+    Convert PDFs referenced in a DataFrame column to Markdown and store them in a zip.
+
+    Files already present in the zip are skipped unless ``replace_all`` is True.
+    Only successful (non-blank) conversions are written.
+
+    Args:
+        df: Source DataFrame.
+        url_column: Column with PDF URLs.
+        method: Conversion backend name (passed to ``convert_pdf_to_md``).
+        zip_path: Output zip path. Failure counts are stored beside it as
+            ``{zip_stem}.failures.json`` when ``max_failures`` is set.
+        md_name_column: Column used to build output filenames.
+        replace_all: If True, re-convert even when the target already exists in the zip.
+        max_failures: If set, skip a filename after it has failed this many times across
+            runs (empty/blank output, download or subprocess failure). ``None`` retries
+            forever (default). A later successful write clears the failure entry.
+        shuffle: If True, shuffle remaining work after filtering existing files and
+            exhausted failures. Helps with transient / rate-limit failures by trying
+            documents in a different order each run.
+    """
+    zip_path = Path(zip_path)
     existing = _ensure_zip(zip_path)
     suffix = f"_{method}.md"
+    failures = _load_failures(zip_path) if max_failures is not None else {}
 
-    # Base filters: valid name+url
-    valid = df[[md_name_column, url_column]].dropna()
-    valid = valid[valid[url_column].astype(str).str.len() > 0]
-
-    # Precompute filenames
-    filenames = _build_filenames(valid[md_name_column], suffix)
-    valid = valid.assign(__filename=filenames)
-
-    # If not replacing, drop rows whose target already exists
-    if not replace_all:
-        valid = valid[~valid["__filename"].isin(existing)]
-
-    # De-dup by target filename to avoid redoing same file
-    valid = valid.drop_duplicates(subset="__filename", keep="first")
+    valid = _prepare_batch_rows(
+        df,
+        md_name_column,
+        url_column,
+        suffix,
+        existing,
+        replace_all,
+        failures,
+        max_failures,
+        shuffle,
+    )
+    if max_failures is not None:
+        _save_failures(zip_path, failures)
 
     if valid.empty:
         logging.info("Nothing to do: all Markdown files already present.")
@@ -143,24 +255,26 @@ def create_markdown_from_column(
 
     progress_bar = tqdm(total=len(valid), desc=f"Markdown ({method})", dynamic_ncols=True)
 
-    # Iterate only filtered rows, use itertuples for speed
-    for url, filename in valid[[url_column, "__filename"]].itertuples(index=False, name=None):
+    for row in valid[[url_column, "__filename"]].itertuples(index=False, name=None):
+        url, filename = row
         markdown = convert_pdf_to_md(url, method)
-    
-        if not markdown or not markdown.strip():
-            logging.warning(f"⚠️ No markdown produced for {filename} (url={url}). Skipping.")
-            progress_bar.update(1)
-            continue
-    
-        try:
-            # be explicit about encoding
-            replace_in_zip(Path(zip_path), filename, markdown.encode("utf-8"))
-            existing.add(filename)
-            tqdm.write(f"✅ wrote {filename} ({len(markdown)} chars)")
-        except Exception as e:
-            logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
-        finally:
-            progress_bar.update(1)
+        wrote = False
+        if markdown.strip():
+            try:
+                replace_in_zip(zip_path, filename, markdown)
+                existing.add(filename)
+                wrote = True
+                if max_failures is not None:
+                    _clear_failure(failures, zip_path, filename)
+            except Exception as e:
+                logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
+
+        if not wrote and max_failures is not None:
+            _record_failure(failures, zip_path, filename, max_failures)
+
+        progress_bar.update(1)
+        if wrote:
+            tqdm.write(f"Markdown created: {filename}")
 
     progress_bar.close()
     logging.info(f"Processed {len(valid)} rows for Markdown conversion using '{method}'")
@@ -217,20 +331,48 @@ def create_text_from_column(
     zip_path: Path,
     txt_name_column: str,
     replace_all: bool = False,
+    max_failures: int | None = None,
+    shuffle: bool = False,
 ):
+    """
+    Convert PDFs referenced in a DataFrame column to plain text and store them in a zip.
+
+    Files already present in the zip are skipped unless ``replace_all`` is True.
+    Only successful (non-blank) conversions are written.
+
+    Args:
+        df: Source DataFrame.
+        url_column: Column with PDF URLs.
+        method: Conversion backend name (passed to ``convert_pdf_to_txt``).
+        zip_path: Output zip path. Failure counts are stored beside it as
+            ``{zip_stem}.failures.json`` when ``max_failures`` is set.
+        txt_name_column: Column used to build output filenames.
+        replace_all: If True, re-convert even when the target already exists in the zip.
+        max_failures: If set, skip a filename after it has failed this many times across
+            runs (empty/blank output, download or subprocess failure). ``None`` retries
+            forever (default). A later successful write clears the failure entry.
+        shuffle: If True, shuffle remaining work after filtering existing files and
+            exhausted failures. Helps with transient / rate-limit failures by trying
+            documents in a different order each run.
+    """
+    zip_path = Path(zip_path)
     existing = _ensure_zip(zip_path)
     suffix = f"_{method}.txt"
+    failures = _load_failures(zip_path) if max_failures is not None else {}
 
-    valid = df[[txt_name_column, url_column]].dropna()
-    valid = valid[valid[url_column].astype(str).str.len() > 0]
-
-    filenames = _build_filenames(valid[txt_name_column], suffix)
-    valid = valid.assign(__filename=filenames)
-
-    if not replace_all:
-        valid = valid[~valid["__filename"].isin(existing)]
-
-    valid = valid.drop_duplicates(subset="__filename", keep="first")
+    valid = _prepare_batch_rows(
+        df,
+        txt_name_column,
+        url_column,
+        suffix,
+        existing,
+        replace_all,
+        failures,
+        max_failures,
+        shuffle,
+    )
+    if max_failures is not None:
+        _save_failures(zip_path, failures)
 
     if valid.empty:
         logging.info("Nothing to do: all text files already present.")
@@ -241,14 +383,23 @@ def create_text_from_column(
     for row in valid[[url_column, "__filename"]].itertuples(index=False, name=None):
         url, filename = row
         text = convert_pdf_to_txt(url, method)
+        wrote = False
         if text.strip():
             try:
-                replace_in_zip(Path(zip_path), filename, text)
+                replace_in_zip(zip_path, filename, text)
                 existing.add(filename)
+                wrote = True
+                if max_failures is not None:
+                    _clear_failure(failures, zip_path, filename)
             except Exception as e:
                 logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
+
+        if not wrote and max_failures is not None:
+            _record_failure(failures, zip_path, filename, max_failures)
+
         progress_bar.update(1)
-        tqdm.write(f"Text created: {filename}")
+        if wrote:
+            tqdm.write(f"Text created: {filename}")
 
     progress_bar.close()
     logging.info(f"Processed {len(valid)} rows for text conversion using '{method}'")
