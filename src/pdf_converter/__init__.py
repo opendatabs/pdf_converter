@@ -18,6 +18,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CONVERT_SCRIPT_MD = SCRIPT_DIR / "convert_single_pdf2md.py"
 CONVERT_SCRIPT_TXT = SCRIPT_DIR / "convert_single_pdf2txt.py"
 
+# Matches Docling Serve document_timeout (1h) plus submit/result HTTP overhead.
+DEFAULT_DOCUMENT_TIMEOUT_SECONDS = 3600
+DEFAULT_CONVERSION_TIMEOUT_SECONDS = DEFAULT_DOCUMENT_TIMEOUT_SECONDS + 300
+
 
 def safe_filename(name):
     # Convert name to string and replace invalid characters
@@ -182,6 +186,7 @@ def _run_batch_conversions(
     max_failures: int | None,
     max_workers: int,
     label: str,
+    conversion_timeout: float = DEFAULT_CONVERSION_TIMEOUT_SECONDS,
 ) -> None:
     """Convert rows; write to zip and update failures on the main thread."""
     row_list = list(rows)
@@ -193,12 +198,15 @@ def _run_batch_conversions(
 
     if workers == 1:
         for url, filename in row_list:
-            content = convert_fn(url, method)
+            content = convert_fn(url, method, conversion_timeout=conversion_timeout)
             _handle_conversion_result(content, filename, zip_path, existing, failures, max_failures, label)
             progress_bar.update(1)
     else:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_filename = {executor.submit(convert_fn, url, method): filename for url, filename in row_list}
+            future_to_filename = {
+                executor.submit(convert_fn, url, method, conversion_timeout=conversion_timeout): filename
+                for url, filename in row_list
+            }
             for future in as_completed(future_to_filename):
                 filename = future_to_filename[future]
                 try:
@@ -230,7 +238,13 @@ def unzip_to_folder(zip_path: Path, target_dir: Path, overwrite: bool = False):
             zf.extract(member, target_dir)
 
 
-def convert_pdf_to_md(pdf_url: str, method: str, pdf_path: Path | None = None) -> str:
+def convert_pdf_to_md(
+    pdf_url: str,
+    method: str,
+    pdf_path: Path | None = None,
+    *,
+    conversion_timeout: float = DEFAULT_CONVERSION_TIMEOUT_SECONDS,
+) -> str:
     """
     Downloads a PDF from a URL and converts it to Markdown using the specified conversion method.
 
@@ -239,6 +253,8 @@ def convert_pdf_to_md(pdf_url: str, method: str, pdf_path: Path | None = None) -
         method (str): The conversion method to use (e.g. 'poppler', 'pdf2text').
         pdf_path (Path, optional): Path to save the downloaded PDF. If omitted, a unique
             temporary file is created and removed after conversion.
+        conversion_timeout: Max seconds for the conversion subprocess. Defaults to 1h plus
+            overhead so Docling Serve async jobs can use the full document timeout.
 
     Returns:
         str: The Markdown content as a string, or an empty string if the process fails.
@@ -267,14 +283,14 @@ def convert_pdf_to_md(pdf_url: str, method: str, pdf_path: Path | None = None) -
                 [sys.executable, str(CONVERT_SCRIPT_MD), str(pdf_path), method],
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=conversion_timeout,
             )
             if result.returncode != 0:
                 logging.error(f"[ERROR] Subprocess failed: {result.stderr}")
                 return ""
             return result.stdout
         except subprocess.TimeoutExpired:
-            logging.error("Conversion timed out.")
+            logging.error("Conversion timed out.", extra={"timeout_seconds": conversion_timeout})
             return ""
         except Exception as e:
             logging.error(f"Unexpected error in subprocess: {e}")
@@ -294,6 +310,7 @@ def create_markdown_from_column(
     max_failures: int | None = None,
     shuffle: bool = False,
     max_workers: int = 1,
+    conversion_timeout: float = DEFAULT_CONVERSION_TIMEOUT_SECONDS,
 ):
     """
     Convert PDFs referenced in a DataFrame column to Markdown and store them in a zip.
@@ -317,6 +334,8 @@ def create_markdown_from_column(
             documents in a different order each run.
         max_workers: Number of parallel conversions (default 1 = sequential). Useful for
             ``docling-serve``; start with 2–4 and raise carefully.
+        conversion_timeout: Max seconds per conversion subprocess. Defaults to 1h plus
+            overhead so Docling Serve async polling can finish.
     """
     zip_path = Path(zip_path)
     existing = _ensure_zip(zip_path)
@@ -351,6 +370,7 @@ def create_markdown_from_column(
         max_failures,
         max_workers,
         "Markdown",
+        conversion_timeout=conversion_timeout,
     )
     logging.info(f"Processed {len(valid)} rows for Markdown conversion using '{method}'")
 
@@ -358,7 +378,13 @@ def create_markdown_from_column(
     unzip_to_folder(zip_path, zip_path.with_suffix(""), overwrite=True)
 
 
-def convert_pdf_to_txt(pdf_url: str, method: str, pdf_path: Path | None = None) -> str:
+def convert_pdf_to_txt(
+    pdf_url: str,
+    method: str,
+    pdf_path: Path | None = None,
+    *,
+    conversion_timeout: float = DEFAULT_CONVERSION_TIMEOUT_SECONDS,
+) -> str:
     """
     Downloads a PDF from a URL and converts it to plain text using the specified method.
 
@@ -367,6 +393,7 @@ def convert_pdf_to_txt(pdf_url: str, method: str, pdf_path: Path | None = None) 
         method (str): The conversion method to use ('pymupdf', 'pdfplumber', etc.).
         pdf_path (Path, optional): Path to save the downloaded PDF. If omitted, a unique
             temporary file is created and removed after conversion.
+        conversion_timeout: Max seconds for the conversion subprocess.
 
     Returns:
         str: The plain text content as a string, or an empty string if the process fails.
@@ -393,14 +420,14 @@ def convert_pdf_to_txt(pdf_url: str, method: str, pdf_path: Path | None = None) 
                 [sys.executable, str(CONVERT_SCRIPT_TXT), str(pdf_path), method],
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=conversion_timeout,
             )
             if result.returncode != 0:
                 logging.error(f"[ERROR] Subprocess failed: {result.stderr}")
                 return ""
             return result.stdout
         except subprocess.TimeoutExpired:
-            logging.error("Conversion timed out.")
+            logging.error("Conversion timed out.", extra={"timeout_seconds": conversion_timeout})
             return ""
         except Exception as e:
             logging.error(f"Unexpected error in subprocess: {e}")
@@ -420,6 +447,7 @@ def create_text_from_column(
     max_failures: int | None = None,
     shuffle: bool = False,
     max_workers: int = 1,
+    conversion_timeout: float = DEFAULT_CONVERSION_TIMEOUT_SECONDS,
 ):
     """
     Convert PDFs referenced in a DataFrame column to plain text and store them in a zip.
@@ -443,6 +471,7 @@ def create_text_from_column(
             documents in a different order each run.
         max_workers: Number of parallel conversions (default 1 = sequential). Useful for
             I/O-bound backends; start with 2–4 and raise carefully.
+        conversion_timeout: Max seconds per conversion subprocess.
     """
     zip_path = Path(zip_path)
     existing = _ensure_zip(zip_path)
@@ -477,6 +506,7 @@ def create_text_from_column(
         max_failures,
         max_workers,
         "Text",
+        conversion_timeout=conversion_timeout,
     )
     logging.info(f"Processed {len(valid)} rows for text conversion using '{method}'")
 
