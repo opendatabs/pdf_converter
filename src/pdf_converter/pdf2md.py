@@ -1,24 +1,26 @@
 import base64
 import io
-import json
 import logging
 import os
 import re
 import shutil
 import tempfile
+import time
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import fitz  # PyMuPDF
 import httpx
 import pdfplumber
 import pymupdf4llm
-import requests
 from docling.document_converter import DocumentConverter
 from dotenv import load_dotenv
 from PIL import Image
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 IMAGE_FOLDER = Path("./images")
 if not IMAGE_FOLDER.exists():
@@ -26,6 +28,137 @@ if not IMAGE_FOLDER.exists():
 
 DOCLING_HTTP_CLIENT = os.getenv("DOCLING_HTTP_CLIENT")
 DOCLING_API_KEY = os.getenv("DOCLING_API_KEY")
+
+_TERMINAL_TASK_STATUSES = frozenset({"success", "failure", "partial_success", "skipped"})
+_SUCCESS_TASK_STATUSES = frozenset({"success", "partial_success"})
+_DEFAULT_POLL_WAIT_SECONDS = 60.0
+_POLL_TIMEOUT_BUFFER_SECONDS = 10.0
+
+
+def _submit_docling_async_task(
+    client: httpx.Client,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    input_file: Path,
+    form_data: dict[str, Any],
+) -> str:
+    """Submit a file for async conversion and return the task id.
+
+    Args:
+        client: Shared httpx client.
+        base_url: Docling Serve base URL.
+        headers: Request headers including authorization.
+        input_file: Path to the PDF to convert.
+        form_data: Multipart form fields for conversion options.
+
+    Returns:
+        The task id assigned by Docling Serve.
+
+    Raises:
+        httpx.HTTPStatusError: If the submit request fails.
+        RuntimeError: If the response does not contain a task_id.
+    """
+    url = f"{base_url.rstrip('/')}/v1/convert/file/async"
+    with input_file.open("rb") as file_handle:
+        files = {"files": (input_file.name, file_handle, "application/pdf")}
+        response = client.post(url, headers=headers, files=files, data=form_data)
+    response.raise_for_status()
+    payload = response.json()
+    task_id = payload.get("task_id")
+    if not task_id:
+        raise RuntimeError(f"Async submit response missing task_id: {payload}")
+    return str(task_id)
+
+
+def _poll_docling_task_until_done(
+    client: httpx.Client,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    task_id: str,
+    poll_wait: float,
+    deadline: float,
+) -> dict[str, Any]:
+    """Long-poll until the task reaches a terminal status.
+
+    Args:
+        client: Shared httpx client.
+        base_url: Docling Serve base URL.
+        headers: Request headers including authorization.
+        task_id: Async task id from submit.
+        poll_wait: Seconds to wait per poll request.
+        deadline: Monotonic clock deadline for the overall poll loop.
+
+    Returns:
+        The final TaskStatusResponse payload.
+
+    Raises:
+        TimeoutError: If the overall deadline is exceeded before completion.
+        httpx.HTTPStatusError: If a poll request fails.
+    """
+    url = f"{base_url.rstrip('/')}/v1/status/poll/{task_id}"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Docling task {task_id} did not finish before deadline")
+
+        wait = min(poll_wait, remaining)
+        response = client.get(
+            url,
+            headers=headers,
+            params={"wait": wait},
+            timeout=wait + _POLL_TIMEOUT_BUFFER_SECONDS,
+        )
+        response.raise_for_status()
+        status_payload: dict[str, Any] = response.json()
+        task_status = str(status_payload.get("task_status", ""))
+        if task_status in _TERMINAL_TASK_STATUSES:
+            return status_payload
+
+    raise TimeoutError(f"Docling task {task_id} did not finish before deadline")
+
+
+def _fetch_docling_task_result(
+    client: httpx.Client,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    task_id: str,
+) -> str | None:
+    """Fetch markdown content for a completed conversion task.
+
+    Args:
+        client: Shared httpx client.
+        base_url: Docling Serve base URL.
+        headers: Request headers including authorization.
+        task_id: Completed async task id.
+
+    Returns:
+        Markdown content on success, or None if the result is missing or invalid.
+
+    Raises:
+        httpx.HTTPStatusError: If the result request fails.
+    """
+    url = f"{base_url.rstrip('/')}/v1/result/{task_id}"
+    response = client.get(url, headers=headers)
+    response.raise_for_status()
+    result: dict[str, Any] = response.json()
+    status = result.get("status")
+    if status not in _SUCCESS_TASK_STATUSES or "document" not in result:
+        logger.error(
+            "Docling task result unsuccessful",
+            extra={"task_id": task_id, "status": status, "errors": result.get("errors")},
+        )
+        return None
+
+    document = result["document"]
+    if not isinstance(document, dict):
+        logger.error("Docling task result document is not a dict", extra={"task_id": task_id})
+        return None
+
+    md_content = document.get("md_content", "")
+    return md_content if isinstance(md_content, str) else None
 
 
 class Converter:
@@ -157,86 +290,136 @@ class Converter:
     def docling_serve_conversion(
         self,
         *,
-        to_formats=["md"],  # Markdown
-        image_export_mode="embedded",  # Embedded images
-        pipeline="standard",  # Standard
-        do_ocr=True,  # Enable OCR
-        force_ocr=False,  # Force OCR off
-        ocr_engine="easyocr",  # EasyOCR
-        ocr_lang=["en", "fr", "de", "it"], 
-        pdf_backend="pypdfium2",  # PDF backend
-        table_mode="accurate",  # Accurate
-        abort_on_error=False,  # Abort on error (UI unchecked -> False)
-        return_as_file=False,  # “Return as File” toggle -> ZIP
-        include_images=True,
-        images_scale=2,
-        md_page_break_placeholder="",
-        page_range=None,  # e.g., [1, 10]
-        document_timeout=3600,  # seconds
-        request_timeout=120,  # seconds
-    ):
+        to_formats: list[str] | None = None,
+        image_export_mode: str = "embedded",
+        pipeline: str = "standard",
+        do_ocr: bool = True,
+        force_ocr: bool = False,
+        ocr_engine: str = "easyocr",
+        ocr_lang: list[str] | None = None,
+        pdf_backend: str = "pypdfium2",
+        table_mode: str = "accurate",
+        abort_on_error: bool = False,
+        return_as_file: bool = False,
+        include_images: bool = True,
+        images_scale: float = 2,
+        md_page_break_placeholder: str = "",
+        page_range: list[int] | None = None,
+        document_timeout: float = 3600,
+        request_timeout: float = 120,
+        poll_wait: float = _DEFAULT_POLL_WAIT_SECONDS,
+    ) -> str | None:
+        """Convert a PDF via Docling Serve async submit/poll/result flow.
+
+        Submits the file to ``/v1/convert/file/async``, long-polls
+        ``/v1/status/poll/{task_id}`` until the task finishes, then fetches
+        markdown from ``/v1/result/{task_id}``. This avoids holding a single
+        HTTP connection open for the full conversion duration.
+
+        Args:
+            to_formats: Output formats requested from Docling Serve.
+            image_export_mode: Image export mode (embedded, placeholder, referenced).
+            pipeline: Processing pipeline name.
+            do_ocr: Whether to run OCR on bitmap content.
+            force_ocr: Whether to replace existing text with OCR text.
+            ocr_engine: OCR engine name (deprecated server-side; still accepted).
+            ocr_lang: Languages passed to the OCR engine.
+            pdf_backend: PDF backend used by Docling Serve.
+            table_mode: Table structure mode (fast or accurate).
+            abort_on_error: Whether conversion should abort on first error.
+            return_as_file: If True, request zip target; otherwise inbody JSON.
+            include_images: Whether to include extracted images.
+            images_scale: Scale factor for extracted images.
+            md_page_break_placeholder: Placeholder inserted between markdown pages.
+            page_range: Optional inclusive page range starting at 1.
+            document_timeout: Server-side per-document timeout in seconds; also
+                used as the client-side overall poll deadline.
+            request_timeout: Timeout in seconds for submit and result requests.
+            poll_wait: Seconds to wait on each status poll request.
+
+        Returns:
+            Markdown content on success, or None on failure.
+
+        Raises:
+            RuntimeError: If required Docling Serve env vars are missing.
+        """
         base_url = DOCLING_HTTP_CLIENT
         if not base_url:
             raise RuntimeError("DOCLING_HTTP_CLIENT is not set.")
-        url = f"{base_url.rstrip('/')}/v1/convert/file"
-
-        # target type: inline JSON vs ZIP file
-        target_type = "zip" if return_as_file else "inbody"
-
-        headers = {"Authorization": f"Bearer {DOCLING_API_KEY}"}
         if not DOCLING_API_KEY:
             raise RuntimeError("DOCLING_API_KEY is not set.")
 
-        data = {
+        if to_formats is None:
+            to_formats = ["md"]
+        if ocr_lang is None:
+            ocr_lang = ["en", "fr", "de", "it"]
+
+        target_type = "zip" if return_as_file else "inbody"
+        headers = {"Authorization": f"Bearer {DOCLING_API_KEY}"}
+        form_data: dict[str, Any] = {
             "to_formats": to_formats,
             "target_type": target_type,
             "document_timeout": document_timeout,
             "include_images": include_images,
-            "image_export_mode": image_export_mode,  # embedded | placeholder | referenced
+            "image_export_mode": image_export_mode,
             "images_scale": images_scale,
             "md_page_break_placeholder": md_page_break_placeholder,
             "pipeline": pipeline,
             "do_ocr": do_ocr,
             "force_ocr": force_ocr,
-            "ocr_engine": ocr_engine,  # easyocr | tesseract | rapidocr
-            "ocr_lang": ocr_lang,  # send JSON array to be safe
-            "pdf_backend": pdf_backend,  # pypdfium2 | dlparse_v1/v2/v4
-            "table_mode": table_mode,  # fast | accurate
+            "ocr_engine": ocr_engine,
+            "ocr_lang": ocr_lang,
+            "pdf_backend": pdf_backend,
+            "table_mode": table_mode,
             "abort_on_error": abort_on_error,
         }
         if page_range:
-            data["page_range"] = page_range
+            form_data["page_range"] = page_range
 
-        with open(self.input_file, "rb") as f:
-            files = {"files": (os.path.basename(self.input_file), f, "application/pdf")}
-
+        deadline = time.monotonic() + float(document_timeout)
+        try:
             with httpx.Client(verify=False, timeout=request_timeout) as client:
-                response = client.post(
-                    url,
+                task_id = _submit_docling_async_task(
+                    client,
+                    base_url=base_url,
                     headers=headers,
-                    files=files,
-                    data=data,
+                    input_file=self.input_file,
+                    form_data=form_data,
                 )
+                logger.info("Submitted Docling async task", extra={"task_id": task_id})
 
-            if response.status_code != 200:
-                logging.error(
-                    f"Failed to convert document {self.input_file}: {response.status_code} - {response.text}"
+                status_payload = _poll_docling_task_until_done(
+                    client,
+                    base_url=base_url,
+                    headers=headers,
+                    task_id=task_id,
+                    poll_wait=poll_wait,
+                    deadline=deadline,
                 )
-                return None
-
-            result: dict[str, str | dict[str, str]] = response.json()
-            if result.get("status") == "success" and "document" in result:
-                document: str | dict[str, str] = result["document"]
-                if isinstance(document, dict):
-                    return document.get("md_content", "")
-                else:
-                    logging.error(f"Failed to convert document {self.input_file}: {document}")
+                task_status = str(status_payload.get("task_status", ""))
+                if task_status not in _SUCCESS_TASK_STATUSES:
+                    logger.error(
+                        "Docling async task failed",
+                        extra={
+                            "task_id": task_id,
+                            "task_status": task_status,
+                            "error_message": status_payload.get("error_message"),
+                        },
+                    )
                     return None
-            else:
-                logging.error(
-                    f"Failed to convert document {self.input_file}: {result.get('status')}. \n Errors: {result.get('errors')}"
+
+                return _fetch_docling_task_result(
+                    client,
+                    base_url=base_url,
+                    headers=headers,
+                    task_id=task_id,
                 )
-                return None
+        except (httpx.HTTPError, TimeoutError, RuntimeError) as exc:
+            logger.error(
+                "Docling Serve async conversion failed",
+                extra={"input_file": str(self.input_file), "error": str(exc)},
+            )
+            return None
 
     def pymupdf4llm_conversion(self):
         """Convert PDF to markdown using pymupdf4llm"""
