@@ -33,14 +33,17 @@ _TERMINAL_TASK_STATUSES = frozenset({"success", "failure", "partial_success", "s
 _SUCCESS_TASK_STATUSES = frozenset({"success", "partial_success"})
 _DEFAULT_POLL_WAIT_SECONDS = 30.0
 _POLL_TIMEOUT_BUFFER_SECONDS = 15.0
-_DEFAULT_SUBMIT_TIMEOUT_SECONDS = 600.0
+_DEFAULT_SUBMIT_TIMEOUT_SECONDS = 60.0
 _DEFAULT_RESULT_TIMEOUT_SECONDS = 120.0
 
 
 def _format_http_error(exc: BaseException) -> str:
     """Build a readable error string, including HTTP response body when available."""
     if isinstance(exc, httpx.TimeoutException):
-        return f"{type(exc).__name__}: {exc}"
+        cause = f"{type(exc).__name__}: {exc}"
+        if exc.__cause__ is not None:
+            cause = f"{cause} (cause={exc.__cause__!r})"
+        return cause
     if isinstance(exc, httpx.HTTPStatusError):
         body = (exc.response.text or "").strip().replace("\n", " ")
         if len(body) > 500:
@@ -49,23 +52,61 @@ def _format_http_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def _build_docling_options(
+    *,
+    to_formats: list[str],
+    image_export_mode: str,
+    pipeline: str,
+    do_ocr: bool,
+    force_ocr: bool,
+    ocr_engine: str,
+    ocr_lang: list[str],
+    pdf_backend: str,
+    table_mode: str,
+    abort_on_error: bool,
+    include_images: bool,
+    images_scale: float,
+    md_page_break_placeholder: str,
+    document_timeout: float,
+    page_range: list[int] | None,
+) -> dict[str, Any]:
+    """Build ConvertDocumentsOptions for the JSON source/async API."""
+    options: dict[str, Any] = {
+        "to_formats": to_formats,
+        "image_export_mode": image_export_mode,
+        "pipeline": pipeline,
+        "do_ocr": do_ocr,
+        "force_ocr": force_ocr,
+        "ocr_engine": ocr_engine,
+        "ocr_lang": ocr_lang,
+        "pdf_backend": pdf_backend,
+        "table_mode": table_mode,
+        "abort_on_error": abort_on_error,
+        "include_images": include_images,
+        "images_scale": images_scale,
+        "md_page_break_placeholder": md_page_break_placeholder,
+        "document_timeout": document_timeout,
+    }
+    if page_range:
+        options["page_range"] = page_range
+    return options
+
+
 def _submit_docling_async_task(
     client: httpx.Client,
     *,
     base_url: str,
     headers: dict[str, str],
-    input_file: Path,
-    form_data: dict[str, Any],
+    payload: dict[str, Any],
     timeout: float,
 ) -> str:
-    """Submit a file for async conversion and return the task id.
+    """Submit an async conversion via ``/v1/convert/source/async`` and return the task id.
 
     Args:
         client: Shared httpx client.
         base_url: Docling Serve base URL.
         headers: Request headers including authorization.
-        input_file: Path to the PDF to convert.
-        form_data: Multipart form fields for conversion options.
+        payload: JSON body with sources, options, and target.
         timeout: HTTP timeout for the submit request in seconds.
 
     Returns:
@@ -73,27 +114,37 @@ def _submit_docling_async_task(
 
     Raises:
         httpx.HTTPStatusError: If the submit request fails.
-        httpx.TimeoutException: If the submit request times out.
+        TimeoutError: If the submit request times out.
         RuntimeError: If the response does not contain a task_id.
     """
-    url = f"{base_url.rstrip('/')}/v1/convert/file/async"
+    url = f"{base_url.rstrip('/')}/v1/convert/source/async"
+    timeout_config = httpx.Timeout(connect=30.0, read=timeout, write=timeout, pool=30.0)
+    logger.info("Submitting Docling async job to %s (timeout=%.0fs)", url, timeout)
+    started = time.monotonic()
     try:
-        with input_file.open("rb") as file_handle:
-            files = {"files": (input_file.name, file_handle, "application/pdf")}
-            response = client.post(
-                url,
-                headers=headers,
-                files=files,
-                data=form_data,
-                timeout=timeout,
-            )
+        response = client.post(url, headers=headers, json=payload, timeout=timeout_config)
     except httpx.TimeoutException as exc:
-        raise TimeoutError(f"submit timed out after {timeout}s") from exc
-    response.raise_for_status()
-    payload = response.json()
-    task_id = payload.get("task_id")
+        elapsed = time.monotonic() - started
+        raise TimeoutError(
+            f"submit {type(exc).__name__} after {elapsed:.1f}s "
+            f"(configured {timeout:.0f}s). Async submit must return a task_id within "
+            f"seconds — Docling Serve may be blocked or a proxy is killing the request. "
+            f"Detail: {exc}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        elapsed = time.monotonic() - started
+        raise RuntimeError(
+            f"submit failed after {elapsed:.1f}s to {url}: {_format_http_error(exc)}"
+        ) from exc
+
+    if response.status_code >= 400:
+        body = (response.text or "").strip().replace("\n", " ")[:500]
+        raise RuntimeError(f"submit HTTP {response.status_code} from {url}: {body}")
+
+    payload_out = response.json()
+    task_id = payload_out.get("task_id")
     if not task_id:
-        raise RuntimeError(f"Async submit response missing task_id: {payload}")
+        raise RuntimeError(f"Async submit response missing task_id: {payload_out}")
     return str(task_id)
 
 
@@ -196,10 +247,13 @@ def _fetch_docling_task_result(
         RuntimeError: If the result payload is missing or invalid.
     """
     url = f"{base_url.rstrip('/')}/v1/result/{task_id}"
+    timeout_config = httpx.Timeout(connect=30.0, read=timeout, write=timeout, pool=30.0)
     try:
-        response = client.get(url, headers=headers, timeout=timeout)
+        response = client.get(url, headers=headers, timeout=timeout_config)
     except httpx.TimeoutException as exc:
-        raise TimeoutError(f"result fetch timed out after {timeout}s for task {task_id}") from exc
+        raise TimeoutError(
+            f"result fetch {type(exc).__name__} after configured {timeout:.0f}s for task {task_id}: {exc}"
+        ) from exc
     response.raise_for_status()
     result: dict[str, Any] = response.json()
     status = result.get("status")
@@ -219,9 +273,10 @@ def _fetch_docling_task_result(
 
 
 class Converter:
-    def __init__(self, lib: str, input_file: Path):
+    def __init__(self, lib: str, input_file: Path, source_url: str | None = None):
         self.lib = lib
         self.input_file = input_file
+        self.source_url = source_url
         fd, temp_path = tempfile.mkstemp(suffix=".md")
         self.output_file = Path(temp_path)  # Store as Path object for easy handling
         self.doc_image_folder = Path(f"{IMAGE_FOLDER}/{self.output_file.stem}")
@@ -370,8 +425,8 @@ class Converter:
     ) -> str | None:
         """Convert a PDF via Docling Serve async submit/poll/result flow.
 
-        Submits the file to ``/v1/convert/file/async``, long-polls
-        ``/v1/status/poll/{task_id}`` until the task finishes, then fetches
+        Submits via ``/v1/convert/source/async`` (HTTP URL or base64 file source),
+        long-polls ``/v1/status/poll/{task_id}`` until the task finishes, then fetches
         markdown from ``/v1/result/{task_id}``. This avoids holding a single
         HTTP connection open for the full conversion duration.
 
@@ -394,7 +449,8 @@ class Converter:
             document_timeout: Server-side per-document timeout in seconds; also
                 used as the client-side overall poll deadline.
             request_timeout: Timeout in seconds for the final result fetch.
-            submit_timeout: Timeout in seconds for the async submit/upload request.
+            submit_timeout: Timeout in seconds for async submit. Must stay short —
+                a healthy ``/v1/convert/source/async`` returns a task_id in seconds.
             poll_wait: Seconds to wait on each status poll request.
 
         Returns:
@@ -414,40 +470,54 @@ class Converter:
         if ocr_lang is None:
             ocr_lang = ["en", "fr", "de", "it"]
 
-        target_type = "zip" if return_as_file else "inbody"
-        headers = {"Authorization": f"Bearer {DOCLING_API_KEY}"}
-        form_data: dict[str, Any] = {
-            "to_formats": to_formats,
-            "target_type": target_type,
-            "document_timeout": document_timeout,
-            "include_images": include_images,
-            "image_export_mode": image_export_mode,
-            "images_scale": images_scale,
-            "md_page_break_placeholder": md_page_break_placeholder,
-            "pipeline": pipeline,
-            "do_ocr": do_ocr,
-            "force_ocr": force_ocr,
-            "ocr_engine": ocr_engine,
-            "ocr_lang": ocr_lang,
-            "pdf_backend": pdf_backend,
-            "table_mode": table_mode,
-            "abort_on_error": abort_on_error,
+        headers = {
+            "Authorization": f"Bearer {DOCLING_API_KEY}",
+            "Content-Type": "application/json",
         }
-        if page_range:
-            form_data["page_range"] = page_range
+        options = _build_docling_options(
+            to_formats=to_formats,
+            image_export_mode=image_export_mode,
+            pipeline=pipeline,
+            do_ocr=do_ocr,
+            force_ocr=force_ocr,
+            ocr_engine=ocr_engine,
+            ocr_lang=ocr_lang,
+            pdf_backend=pdf_backend,
+            table_mode=table_mode,
+            abort_on_error=abort_on_error,
+            include_images=include_images,
+            images_scale=images_scale,
+            md_page_break_placeholder=md_page_break_placeholder,
+            document_timeout=document_timeout,
+            page_range=page_range,
+        )
+        target_kind = "zip" if return_as_file else "inbody"
+        if self.source_url:
+            source: dict[str, Any] = {"kind": "http", "url": self.source_url}
+        else:
+            # Fall back to base64 file source (still JSON async, not multipart upload).
+            encoded = base64.b64encode(self.input_file.read_bytes()).decode("ascii")
+            source = {
+                "kind": "file",
+                "filename": self.input_file.name,
+                "base64_string": encoded,
+            }
+        payload: dict[str, Any] = {
+            "options": options,
+            "sources": [source],
+            "target": {"kind": target_kind},
+        }
 
         deadline = time.monotonic() + float(document_timeout)
         self.last_error = None
-        # No default read timeout on the client — each phase sets its own budget.
-        client_timeout = httpx.Timeout(connect=30.0, read=None, write=submit_timeout, pool=30.0)
         try:
-            with httpx.Client(verify=False, timeout=client_timeout) as client:
+            # No client-level read timeout — each phase sets an explicit Timeout.
+            with httpx.Client(verify=False, timeout=None) as client:
                 task_id = _submit_docling_async_task(
                     client,
                     base_url=base_url,
                     headers=headers,
-                    input_file=self.input_file,
-                    form_data=form_data,
+                    payload=payload,
                     timeout=submit_timeout,
                 )
                 logger.info(

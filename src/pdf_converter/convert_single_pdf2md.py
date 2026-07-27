@@ -9,7 +9,8 @@ if __name__ == "__main__":
 
     input_path = Path(sys.argv[1])
     method = sys.argv[2]
-    converter = Converter(lib=method, input_file=input_path)
+    source_url = sys.argv[3] if len(sys.argv) > 3 else None
+    converter = Converter(lib=method, input_file=input_path, source_url=source_url)
     try:
         converter.convert()
         with open(converter.output_file, "r", encoding="utf-8") as f:
