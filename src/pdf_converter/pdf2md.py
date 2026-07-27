@@ -31,18 +31,22 @@ DOCLING_API_KEY = os.getenv("DOCLING_API_KEY")
 
 _TERMINAL_TASK_STATUSES = frozenset({"success", "failure", "partial_success", "skipped"})
 _SUCCESS_TASK_STATUSES = frozenset({"success", "partial_success"})
-_DEFAULT_POLL_WAIT_SECONDS = 60.0
-_POLL_TIMEOUT_BUFFER_SECONDS = 10.0
+_DEFAULT_POLL_WAIT_SECONDS = 30.0
+_POLL_TIMEOUT_BUFFER_SECONDS = 15.0
+_DEFAULT_SUBMIT_TIMEOUT_SECONDS = 600.0
+_DEFAULT_RESULT_TIMEOUT_SECONDS = 120.0
 
 
 def _format_http_error(exc: BaseException) -> str:
     """Build a readable error string, including HTTP response body when available."""
+    if isinstance(exc, httpx.TimeoutException):
+        return f"{type(exc).__name__}: {exc}"
     if isinstance(exc, httpx.HTTPStatusError):
         body = (exc.response.text or "").strip().replace("\n", " ")
         if len(body) > 500:
             body = f"{body[:500]}..."
         return f"{exc} | response={body}" if body else str(exc)
-    return str(exc)
+    return f"{type(exc).__name__}: {exc}"
 
 
 def _submit_docling_async_task(
@@ -52,6 +56,7 @@ def _submit_docling_async_task(
     headers: dict[str, str],
     input_file: Path,
     form_data: dict[str, Any],
+    timeout: float,
 ) -> str:
     """Submit a file for async conversion and return the task id.
 
@@ -61,18 +66,29 @@ def _submit_docling_async_task(
         headers: Request headers including authorization.
         input_file: Path to the PDF to convert.
         form_data: Multipart form fields for conversion options.
+        timeout: HTTP timeout for the submit request in seconds.
 
     Returns:
         The task id assigned by Docling Serve.
 
     Raises:
         httpx.HTTPStatusError: If the submit request fails.
+        httpx.TimeoutException: If the submit request times out.
         RuntimeError: If the response does not contain a task_id.
     """
     url = f"{base_url.rstrip('/')}/v1/convert/file/async"
-    with input_file.open("rb") as file_handle:
-        files = {"files": (input_file.name, file_handle, "application/pdf")}
-        response = client.post(url, headers=headers, files=files, data=form_data)
+    try:
+        with input_file.open("rb") as file_handle:
+            files = {"files": (input_file.name, file_handle, "application/pdf")}
+            response = client.post(
+                url,
+                headers=headers,
+                files=files,
+                data=form_data,
+                timeout=timeout,
+            )
+    except httpx.TimeoutException as exc:
+        raise TimeoutError(f"submit timed out after {timeout}s") from exc
     response.raise_for_status()
     payload = response.json()
     task_id = payload.get("task_id")
@@ -92,6 +108,9 @@ def _poll_docling_task_until_done(
 ) -> dict[str, Any]:
     """Long-poll until the task reaches a terminal status.
 
+    Individual poll HTTP timeouts are retried until ``deadline``. Only the overall
+    deadline fails the conversion — a single slow poll must not abort a 1h job.
+
     Args:
         client: Shared httpx client.
         base_url: Docling Serve base URL.
@@ -105,28 +124,50 @@ def _poll_docling_task_until_done(
 
     Raises:
         TimeoutError: If the overall deadline is exceeded before completion.
-        httpx.HTTPStatusError: If a poll request fails.
+        httpx.HTTPStatusError: If a poll request fails with a non-timeout HTTP error.
     """
     url = f"{base_url.rstrip('/')}/v1/status/poll/{task_id}"
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError(f"Docling task {task_id} did not finish before deadline")
+            raise TimeoutError(
+                f"poll deadline exceeded for task {task_id} "
+                f"(document_timeout budget exhausted)"
+            )
 
         wait = min(poll_wait, remaining)
-        response = client.get(
-            url,
-            headers=headers,
-            params={"wait": wait},
-            timeout=wait + _POLL_TIMEOUT_BUFFER_SECONDS,
-        )
-        response.raise_for_status()
+        request_timeout = wait + _POLL_TIMEOUT_BUFFER_SECONDS
+        try:
+            response = client.get(
+                url,
+                headers=headers,
+                params={"wait": wait},
+                timeout=request_timeout,
+            )
+            response.raise_for_status()
+        except httpx.TimeoutException:
+            logger.warning(
+                "Docling poll timed out for task %s after %.0fs; retrying (%.0fs left)",
+                task_id,
+                request_timeout,
+                deadline - time.monotonic(),
+            )
+            continue
+
         status_payload: dict[str, Any] = response.json()
         task_status = str(status_payload.get("task_status", ""))
+        logger.info(
+            "Docling task %s status=%s (%.0fs left)",
+            task_id,
+            task_status,
+            deadline - time.monotonic(),
+        )
         if task_status in _TERMINAL_TASK_STATUSES:
             return status_payload
 
-    raise TimeoutError(f"Docling task {task_id} did not finish before deadline")
+    raise TimeoutError(
+        f"poll deadline exceeded for task {task_id} (document_timeout budget exhausted)"
+    )
 
 
 def _fetch_docling_task_result(
@@ -135,6 +176,7 @@ def _fetch_docling_task_result(
     base_url: str,
     headers: dict[str, str],
     task_id: str,
+    timeout: float,
 ) -> str:
     """Fetch markdown content for a completed conversion task.
 
@@ -143,16 +185,21 @@ def _fetch_docling_task_result(
         base_url: Docling Serve base URL.
         headers: Request headers including authorization.
         task_id: Completed async task id.
+        timeout: HTTP timeout for the result request in seconds.
 
     Returns:
         Markdown content on success.
 
     Raises:
         httpx.HTTPStatusError: If the result request fails.
+        TimeoutError: If the result request times out.
         RuntimeError: If the result payload is missing or invalid.
     """
     url = f"{base_url.rstrip('/')}/v1/result/{task_id}"
-    response = client.get(url, headers=headers)
+    try:
+        response = client.get(url, headers=headers, timeout=timeout)
+    except httpx.TimeoutException as exc:
+        raise TimeoutError(f"result fetch timed out after {timeout}s for task {task_id}") from exc
     response.raise_for_status()
     result: dict[str, Any] = response.json()
     status = result.get("status")
@@ -317,7 +364,8 @@ class Converter:
         md_page_break_placeholder: str = "",
         page_range: list[int] | None = None,
         document_timeout: float = 3600,
-        request_timeout: float = 120,
+        request_timeout: float = _DEFAULT_RESULT_TIMEOUT_SECONDS,
+        submit_timeout: float = _DEFAULT_SUBMIT_TIMEOUT_SECONDS,
         poll_wait: float = _DEFAULT_POLL_WAIT_SECONDS,
     ) -> str | None:
         """Convert a PDF via Docling Serve async submit/poll/result flow.
@@ -345,7 +393,8 @@ class Converter:
             page_range: Optional inclusive page range starting at 1.
             document_timeout: Server-side per-document timeout in seconds; also
                 used as the client-side overall poll deadline.
-            request_timeout: Timeout in seconds for submit and result requests.
+            request_timeout: Timeout in seconds for the final result fetch.
+            submit_timeout: Timeout in seconds for the async submit/upload request.
             poll_wait: Seconds to wait on each status poll request.
 
         Returns:
@@ -389,16 +438,23 @@ class Converter:
 
         deadline = time.monotonic() + float(document_timeout)
         self.last_error = None
+        # No default read timeout on the client — each phase sets its own budget.
+        client_timeout = httpx.Timeout(connect=30.0, read=None, write=submit_timeout, pool=30.0)
         try:
-            with httpx.Client(verify=False, timeout=request_timeout) as client:
+            with httpx.Client(verify=False, timeout=client_timeout) as client:
                 task_id = _submit_docling_async_task(
                     client,
                     base_url=base_url,
                     headers=headers,
                     input_file=self.input_file,
                     form_data=form_data,
+                    timeout=submit_timeout,
                 )
-                logger.info("Submitted Docling async task %s", task_id)
+                logger.info(
+                    "Submitted Docling async task %s (poll up to %.0fs)",
+                    task_id,
+                    document_timeout,
+                )
 
                 status_payload = _poll_docling_task_until_done(
                     client,
@@ -423,6 +479,7 @@ class Converter:
                     base_url=base_url,
                     headers=headers,
                     task_id=task_id,
+                    timeout=request_timeout,
                 )
         except (httpx.HTTPError, TimeoutError, RuntimeError) as exc:
             self.last_error = (
