@@ -546,5 +546,9 @@ class Converter:
         else:
             self.md_content = self.pymupdf_conversion()
 
+        if self.md_content is None:
+            # Keep subprocess output contract stable: failed conversions emit empty output.
+            self.md_content = ""
+
         with open(self.output_file, "w", encoding="utf-8") as f:
             f.write(self.md_content)
