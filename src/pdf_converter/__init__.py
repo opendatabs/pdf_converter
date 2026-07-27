@@ -296,12 +296,8 @@ def convert_pdf_to_md(
 
         # Subprocess for crash isolation
         try:
-            cmd = [sys.executable, str(CONVERT_SCRIPT_MD), str(pdf_path), method]
-            if method.lower() == "docling-serve":
-                # Prefer URL-based Docling source/async submit (returns task_id immediately).
-                cmd.append(pdf_url)
             result = subprocess.run(
-                cmd,
+                [sys.executable, str(CONVERT_SCRIPT_MD), str(pdf_path), method],
                 capture_output=True,
                 text=True,
                 timeout=conversion_timeout,
