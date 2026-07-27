@@ -35,6 +35,16 @@ _DEFAULT_POLL_WAIT_SECONDS = 60.0
 _POLL_TIMEOUT_BUFFER_SECONDS = 10.0
 
 
+def _format_http_error(exc: BaseException) -> str:
+    """Build a readable error string, including HTTP response body when available."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        body = (exc.response.text or "").strip().replace("\n", " ")
+        if len(body) > 500:
+            body = f"{body[:500]}..."
+        return f"{exc} | response={body}" if body else str(exc)
+    return str(exc)
+
+
 def _submit_docling_async_task(
     client: httpx.Client,
     *,
@@ -125,7 +135,7 @@ def _fetch_docling_task_result(
     base_url: str,
     headers: dict[str, str],
     task_id: str,
-) -> str | None:
+) -> str:
     """Fetch markdown content for a completed conversion task.
 
     Args:
@@ -135,10 +145,11 @@ def _fetch_docling_task_result(
         task_id: Completed async task id.
 
     Returns:
-        Markdown content on success, or None if the result is missing or invalid.
+        Markdown content on success.
 
     Raises:
         httpx.HTTPStatusError: If the result request fails.
+        RuntimeError: If the result payload is missing or invalid.
     """
     url = f"{base_url.rstrip('/')}/v1/result/{task_id}"
     response = client.get(url, headers=headers)
@@ -146,19 +157,18 @@ def _fetch_docling_task_result(
     result: dict[str, Any] = response.json()
     status = result.get("status")
     if status not in _SUCCESS_TASK_STATUSES or "document" not in result:
-        logger.error(
-            "Docling task result unsuccessful",
-            extra={"task_id": task_id, "status": status, "errors": result.get("errors")},
+        raise RuntimeError(
+            f"Docling task {task_id} result unsuccessful: status={status}, errors={result.get('errors')}"
         )
-        return None
 
     document = result["document"]
     if not isinstance(document, dict):
-        logger.error("Docling task result document is not a dict", extra={"task_id": task_id})
-        return None
+        raise RuntimeError(f"Docling task {task_id} result document is not a dict: {document!r}")
 
     md_content = document.get("md_content", "")
-    return md_content if isinstance(md_content, str) else None
+    if not isinstance(md_content, str):
+        raise RuntimeError(f"Docling task {task_id} md_content is not a string: {type(md_content)!r}")
+    return md_content
 
 
 class Converter:
@@ -171,6 +181,7 @@ class Converter:
         self.doc_image_folder.mkdir(parents=True, exist_ok=True)
         self.md_content = ""
         self.create_image_zip_file = False
+        self.last_error: str | None = None
 
     def has_image_extraction(self):
         return self.lib.lower() in ["mistral-ocr"]
@@ -377,6 +388,7 @@ class Converter:
             form_data["page_range"] = page_range
 
         deadline = time.monotonic() + float(document_timeout)
+        self.last_error = None
         try:
             with httpx.Client(verify=False, timeout=request_timeout) as client:
                 task_id = _submit_docling_async_task(
@@ -386,7 +398,7 @@ class Converter:
                     input_file=self.input_file,
                     form_data=form_data,
                 )
-                logger.info("Submitted Docling async task", extra={"task_id": task_id})
+                logger.info("Submitted Docling async task %s", task_id)
 
                 status_payload = _poll_docling_task_until_done(
                     client,
@@ -398,14 +410,12 @@ class Converter:
                 )
                 task_status = str(status_payload.get("task_status", ""))
                 if task_status not in _SUCCESS_TASK_STATUSES:
-                    logger.error(
-                        "Docling async task failed",
-                        extra={
-                            "task_id": task_id,
-                            "task_status": task_status,
-                            "error_message": status_payload.get("error_message"),
-                        },
+                    error_message = status_payload.get("error_message")
+                    self.last_error = (
+                        f"Docling async task {task_id} failed: "
+                        f"status={task_status}, error_message={error_message}"
                     )
+                    logger.error(self.last_error)
                     return None
 
                 return _fetch_docling_task_result(
@@ -415,10 +425,10 @@ class Converter:
                     task_id=task_id,
                 )
         except (httpx.HTTPError, TimeoutError, RuntimeError) as exc:
-            logger.error(
-                "Docling Serve async conversion failed",
-                extra={"input_file": str(self.input_file), "error": str(exc)},
+            self.last_error = (
+                f"Docling Serve async conversion failed for {self.input_file}: {_format_http_error(exc)}"
             )
+            logger.error(self.last_error)
             return None
 
     def pymupdf4llm_conversion(self):
@@ -548,6 +558,8 @@ class Converter:
 
         if self.md_content is None:
             # Keep subprocess output contract stable: failed conversions emit empty output.
+            if not self.last_error:
+                self.last_error = f"Conversion with {lib} returned no content"
             self.md_content = ""
 
         with open(self.output_file, "w", encoding="utf-8") as f:

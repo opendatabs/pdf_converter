@@ -92,10 +92,19 @@ def _save_failures(zip_path: Path, failures: dict[str, int]) -> None:
         json.dump(failures, f, indent=2, sort_keys=True)
 
 
-def _record_failure(failures: dict[str, int], zip_path: Path, filename: str, max_failures: int) -> None:
+def _record_failure(
+    failures: dict[str, int],
+    zip_path: Path,
+    filename: str,
+    max_failures: int,
+    reason: str | None = None,
+) -> None:
     count = failures.get(filename, 0) + 1
     failures[filename] = count
-    logging.warning(f"Conversion failed for {filename}: {count}/{max_failures}")
+    if reason:
+        logging.warning(f"Conversion failed for {filename}: {count}/{max_failures} — {reason}")
+    else:
+        logging.warning(f"Conversion failed for {filename}: {count}/{max_failures}")
     _save_failures(zip_path, failures)
 
 
@@ -155,6 +164,7 @@ def _handle_conversion_result(
     failures: dict[str, int],
     max_failures: int | None,
     label: str,
+    failure_reason: str | None = None,
 ) -> bool:
     """Write successful content to the zip; update failure counts. Returns True if written."""
     wrote = False
@@ -167,9 +177,10 @@ def _handle_conversion_result(
                 _clear_failure(failures, zip_path, filename)
         except Exception as e:
             logging.error(f"⚠️ Failed to write {filename} to ZIP: {e}")
+            failure_reason = str(e)
 
     if not wrote and max_failures is not None:
-        _record_failure(failures, zip_path, filename, max_failures)
+        _record_failure(failures, zip_path, filename, max_failures, reason=failure_reason)
 
     if wrote:
         tqdm.write(f"{label} created: {filename}")
@@ -178,7 +189,7 @@ def _handle_conversion_result(
 
 def _run_batch_conversions(
     rows: Iterable[tuple[str, str]],
-    convert_fn: Callable[..., str],
+    convert_fn: Callable[..., tuple[str, str | None]],
     method: str,
     zip_path: Path,
     existing: set[str],
@@ -196,25 +207,29 @@ def _run_batch_conversions(
     progress_bar = tqdm(total=len(row_list), desc=f"{label} ({method})", dynamic_ncols=True)
     workers = max(1, max_workers)
 
+    def _convert(url: str) -> tuple[str, str | None]:
+        return convert_fn(url, method, conversion_timeout=conversion_timeout)
+
     if workers == 1:
         for url, filename in row_list:
-            content = convert_fn(url, method, conversion_timeout=conversion_timeout)
-            _handle_conversion_result(content, filename, zip_path, existing, failures, max_failures, label)
+            content, failure_reason = _convert(url)
+            _handle_conversion_result(
+                content, filename, zip_path, existing, failures, max_failures, label, failure_reason
+            )
             progress_bar.update(1)
     else:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_filename = {
-                executor.submit(convert_fn, url, method, conversion_timeout=conversion_timeout): filename
-                for url, filename in row_list
-            }
+            future_to_filename = {executor.submit(_convert, url): filename for url, filename in row_list}
             for future in as_completed(future_to_filename):
                 filename = future_to_filename[future]
                 try:
-                    content = future.result()
+                    content, failure_reason = future.result()
                 except Exception as e:
                     logging.error(f"Unexpected conversion error for {filename}: {e}")
-                    content = ""
-                _handle_conversion_result(content, filename, zip_path, existing, failures, max_failures, label)
+                    content, failure_reason = "", str(e)
+                _handle_conversion_result(
+                    content, filename, zip_path, existing, failures, max_failures, label, failure_reason
+                )
                 progress_bar.update(1)
 
     progress_bar.close()
@@ -244,7 +259,7 @@ def convert_pdf_to_md(
     pdf_path: Path | None = None,
     *,
     conversion_timeout: float = DEFAULT_CONVERSION_TIMEOUT_SECONDS,
-) -> str:
+) -> tuple[str, str | None]:
     """
     Downloads a PDF from a URL and converts it to Markdown using the specified conversion method.
 
@@ -257,7 +272,8 @@ def convert_pdf_to_md(
             overhead so Docling Serve async jobs can use the full document timeout.
 
     Returns:
-        str: The Markdown content as a string, or an empty string if the process fails.
+        A tuple of ``(markdown_content, failure_reason)``. On success, ``failure_reason``
+        is ``None``. On failure, content is empty and ``failure_reason`` explains why.
     """
     own_temp = pdf_path is None
     if own_temp:
@@ -274,8 +290,9 @@ def convert_pdf_to_md(
             with open(pdf_path, "wb") as file:
                 file.write(r_pdf.content)
         except Exception as e:
-            logging.error(f"Failed to download PDF: {e}")
-            return ""
+            reason = f"Failed to download PDF: {e}"
+            logging.error(reason)
+            return "", reason
 
         # Subprocess for crash isolation
         try:
@@ -286,15 +303,22 @@ def convert_pdf_to_md(
                 timeout=conversion_timeout,
             )
             if result.returncode != 0:
-                logging.error(f"[ERROR] Subprocess failed: {result.stderr}")
-                return ""
-            return result.stdout
+                reason = (result.stderr or result.stdout or "subprocess failed with no output").strip()
+                logging.error(f"[ERROR] Subprocess failed: {reason}")
+                return "", reason
+            if not result.stdout.strip():
+                reason = (result.stderr or "empty conversion output").strip()
+                logging.error(f"[ERROR] Conversion produced empty output: {reason}")
+                return "", reason
+            return result.stdout, None
         except subprocess.TimeoutExpired:
-            logging.error("Conversion timed out.", extra={"timeout_seconds": conversion_timeout})
-            return ""
+            reason = f"Conversion timed out after {conversion_timeout}s"
+            logging.error(reason)
+            return "", reason
         except Exception as e:
-            logging.error(f"Unexpected error in subprocess: {e}")
-            return ""
+            reason = f"Unexpected error in subprocess: {e}"
+            logging.error(reason)
+            return "", reason
     finally:
         if own_temp and pdf_path is not None:
             pdf_path.unlink(missing_ok=True)
@@ -384,7 +408,7 @@ def convert_pdf_to_txt(
     pdf_path: Path | None = None,
     *,
     conversion_timeout: float = DEFAULT_CONVERSION_TIMEOUT_SECONDS,
-) -> str:
+) -> tuple[str, str | None]:
     """
     Downloads a PDF from a URL and converts it to plain text using the specified method.
 
@@ -396,7 +420,8 @@ def convert_pdf_to_txt(
         conversion_timeout: Max seconds for the conversion subprocess.
 
     Returns:
-        str: The plain text content as a string, or an empty string if the process fails.
+        A tuple of ``(text_content, failure_reason)``. On success, ``failure_reason`` is
+        ``None``. On failure, content is empty and ``failure_reason`` explains why.
     """
     own_temp = pdf_path is None
     if own_temp:
@@ -412,8 +437,9 @@ def convert_pdf_to_txt(
             with open(pdf_path, "wb") as file:
                 file.write(r_pdf.content)
         except Exception as e:
-            logging.error(f"Failed to download PDF: {e}")
-            return ""
+            reason = f"Failed to download PDF: {e}"
+            logging.error(reason)
+            return "", reason
 
         try:
             result = subprocess.run(
@@ -423,15 +449,22 @@ def convert_pdf_to_txt(
                 timeout=conversion_timeout,
             )
             if result.returncode != 0:
-                logging.error(f"[ERROR] Subprocess failed: {result.stderr}")
-                return ""
-            return result.stdout
+                reason = (result.stderr or result.stdout or "subprocess failed with no output").strip()
+                logging.error(f"[ERROR] Subprocess failed: {reason}")
+                return "", reason
+            if not result.stdout.strip():
+                reason = (result.stderr or "empty conversion output").strip()
+                logging.error(f"[ERROR] Conversion produced empty output: {reason}")
+                return "", reason
+            return result.stdout, None
         except subprocess.TimeoutExpired:
-            logging.error("Conversion timed out.", extra={"timeout_seconds": conversion_timeout})
-            return ""
+            reason = f"Conversion timed out after {conversion_timeout}s"
+            logging.error(reason)
+            return "", reason
         except Exception as e:
-            logging.error(f"Unexpected error in subprocess: {e}")
-            return ""
+            reason = f"Unexpected error in subprocess: {e}"
+            logging.error(reason)
+            return "", reason
     finally:
         if own_temp and pdf_path is not None:
             pdf_path.unlink(missing_ok=True)
