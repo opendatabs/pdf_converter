@@ -12,14 +12,16 @@ if __name__ == "__main__":
     converter = Converter(lib=method, input_file=input_path)
     try:
         converter.convert()
-        with open(converter.output_file, "r", encoding="utf-8") as f:
-            content = f.read()
-        if not content.strip():
-            reason = converter.last_error or "empty conversion output"
-            print(f"[ERROR] Conversion failed: {reason}", file=sys.stderr)
+        content = converter.output_file.read_text(encoding="utf-8")
+        if converter.last_error:
+            print(f"[ERROR] Conversion failed: {converter.last_error}", file=sys.stderr)
             sys.exit(1)
-        print(content)
+        if not content.strip():
+            print("[WARN] Conversion produced no content", file=sys.stderr)
+        sys.stdout.write(content)
         sys.exit(0)
     except Exception as e:
         print(f"[ERROR] Conversion failed: {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        converter.cleanup()

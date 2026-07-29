@@ -8,10 +8,36 @@ This package is not published on PyPI and is intended to be installed directly f
 
 You can install this package using either `pip` or [`uv`](https://github.com/astral-sh/uv).
 
+Each conversion method lives in its own module behind its own **extra**, so you
+only install the dependencies for the methods you actually use. The base install
+pulls in nothing heavier than `pandas`, `requests` and `tqdm`.
+
+| Method (`method=`) | Extra | Pulls in | Module |
+| --- | --- | --- | --- |
+| `docling-serve` | `docling-serve` | `httpx` | `backends/docling_serve.py` |
+| `docling` | `docling` | `docling` (+ torch, models) | `backends/docling_local.py` |
+| `pymupdf4llm` | `pymupdf4llm` | `pymupdf4llm` | `backends/pymupdf4llm_backend.py` |
+| `pymupdf` | `pymupdf` | `pymupdf` | `backends/pymupdf_backend.py` |
+| `pdfplumber` | `pdfplumber` | `pdfplumber` | `backends/pdfplumber_backend.py` |
+| _(image extraction)_ | `images` | `pymupdf`, `pillow` | `backends/images.py` |
+| _(everything)_ | `all` | all of the above | — |
+
+Selecting one backend never imports another's dependencies, and picking a method
+whose extra is missing raises a `MissingBackendDependency` naming the extra to install.
+
+Recommended for the remote Docling Serve service — `httpx` only, no local model stack:
+
+```bash
+uv add "pdf-converter[docling-serve] @ git+https://github.com/opendatabs/pdf_converter"
+```
+
 ### Install with `uv`
 
 ```bash
 uv add "git+https://github.com/opendatabs/pdf_converter"
+
+# with extras
+uv add "pdf-converter[docling-serve,pymupdf] @ git+https://github.com/opendatabs/pdf_converter"
 ```
 
 You can also install a specific tag, commit, or branch:
@@ -31,6 +57,9 @@ uv add "git+https://github.com/opendatabs/pdf_converter@main"
 
 ```bash
 pip install "git+https://github.com/opendatabs/pdf_converter"
+
+# with extras
+pip install "pdf-converter[docling-serve] @ git+https://github.com/opendatabs/pdf_converter"
 ```
 
 As with `uv`, you can install a specific reference:
@@ -45,6 +74,48 @@ pip install "git+https://github.com/opendatabs/pdf_converter@<commit-sha>"
 # From a branch
 pip install "git+https://github.com/opendatabs/pdf_converter@main"
 ```
+
+## Docling Serve
+
+`method="docling-serve"` converts against a remote [Docling Serve](https://github.com/docling-project/docling-serve)
+instance using its asynchronous API: one file is submitted to
+`POST /v1/convert/file/async`, its `task_id` is polled at `GET /v1/status/poll/{task_id}`
+until the task is terminal, then the markdown is fetched from `GET /v1/result/{task_id}`.
+
+Configure it with two environment variables (a `.env` file is read automatically):
+
+```bash
+DOCLING_HTTP_CLIENT=https://docling.internal.example/   # required
+DOCLING_API_KEY=...                                     # optional; omitted = no auth header
+```
+
+Unlike the other methods this one runs in-process rather than in a subprocess —
+there is no local library to crash, so a subprocess would only add startup cost.
+
+Notes on the polling loop:
+
+- Polling paces itself with an explicit `poll_interval` sleep. The server's `wait`
+  query parameter is sent as a hint only, because docling-serve does not reliably
+  honour it ([docling-serve#388](https://github.com/docling-project/docling-serve/issues/388));
+  depending on it turns the loop into a busy loop against the server.
+- Transient poll failures (connection errors, timeouts, 5xx, and 404s within a
+  60s grace window after submit — see [docling-serve#467](https://github.com/docling-project/docling-serve/issues/467))
+  are retried instead of failing a job that may already be an hour in.
+- Queue time and conversion time have separate budgets (`queue_timeout` and
+  `document_timeout`), so a long server queue cannot eat the conversion budget.
+  `document_timeout` restarts once the task is first reported as started.
+
+For a single file you can bypass the batch helpers entirely:
+
+```python
+from pathlib import Path
+from pdf_converter.docling_client import convert_file_to_markdown
+
+md = convert_file_to_markdown(Path("report.pdf"), poll_interval=5.0, document_timeout=3600)
+```
+
+TLS verification is disabled by default (`verify=False`) for internally hosted
+instances using a private CA.
 
 ## Bulk conversion helpers
 
@@ -73,6 +144,18 @@ create_markdown_from_column(
     max_workers=4,
 )
 ```
+
+## Architecture & Execution Model
+
+- **Subprocess Crash Isolation**: Local conversion backends (`docling`, `pymupdf`, `pymupdf4llm`, `pdfplumber`) run inside a subprocess per document. This ensures heavy C-libraries or memory leaks in PDF parsers do not crash the primary orchestration process.
+- **In-Process Remote Backend**: Remote backends like `docling-serve` run in-process using `httpx`, avoiding subprocess overhead since conversion logic runs on the remote server.
+- **CLI Helper Scripts**: `convert_single_pdf2md.py` and `convert_single_pdf2txt.py` write converted content byte-for-byte to `stdout` and logs/errors to `stderr`.
+
+## Backend Heuristics & Features
+
+- **`pymupdf`**: Infers Markdown headings based on font size thresholds (`H1 >= 18pt`, `H2 >= 16pt`, `H3 >= 14pt`) and formatting flags (bold).
+- **`pdfplumber`**: Infers headings when a word's font size is > 1.2× the page average font size, and formats extracted tables into Markdown tables.
+- **`images`**: Extracts embedded raster images from PDF pages and saves them as PNG files.
 
 ## Development
 

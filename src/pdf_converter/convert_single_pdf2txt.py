@@ -9,9 +9,10 @@ if __name__ == "__main__":
     converter = TextConverter(lib=method, input_file=input_path)
     try:
         converter.convert()
-        with open(converter.output_file, "r", encoding="utf-8") as f:
-            print(f.read())
+        sys.stdout.write(converter.output_file.read_text(encoding="utf-8"))
         sys.exit(0)
     except Exception as e:
         print(f"[ERROR] Conversion failed: {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        converter.cleanup()
