@@ -11,13 +11,24 @@ from types import ModuleType
 
 logger = logging.getLogger(__name__)
 
+EXIT_MISSING_DEPENDENCY = 3
+EXIT_UNKNOWN_BACKEND = 4
+
 
 class MissingBackendDependency(ImportError):
     """Raised when a backend is selected but its dependency is not installed."""
 
 
+class UnknownBackend(ValueError):
+    """Raised when a method name does not match any registered backend."""
+
+
 def require(module: str, *, backend: str, extra: str) -> ModuleType:
     """Import ``module``, or explain which extra provides it.
+
+    Only a genuinely absent ``module`` is reported as a missing extra. An import
+    error raised from *inside* an installed package propagates unchanged, so a
+    broken dependency is not mistaken for an uninstalled one.
 
     Args:
         module: Importable module name, e.g. ``"pymupdf4llm"``.
@@ -32,7 +43,9 @@ def require(module: str, *, backend: str, extra: str) -> ModuleType:
     """
     try:
         return importlib.import_module(module)
-    except ImportError as exc:
+    except ModuleNotFoundError as exc:
+        if exc.name is None or not (module == exc.name or module.startswith(f"{exc.name}.")):
+            raise
         raise MissingBackendDependency(
             f"Backend '{backend}' requires the '{module}' package, which is not installed. "
             f"Install it with:  pip install 'pdf-converter[{extra}]'  "

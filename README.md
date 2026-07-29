@@ -24,6 +24,10 @@ pulls in nothing heavier than `pandas`, `requests` and `tqdm`.
 
 Selecting one backend never imports another's dependencies, and picking a method
 whose extra is missing raises a `MissingBackendDependency` naming the extra to install.
+An unrecognised method name raises `UnknownBackend` rather than falling back to a
+default backend — a fallback would store one backend's output under another's filename.
+Note that `docling-serve`, `docling` and `pymupdf4llm` are markdown-only: passing them
+to the text helpers raises `UnknownBackend`.
 
 Recommended for the remote Docling Serve service — `httpx` only, no local model stack:
 
@@ -114,16 +118,19 @@ from pdf_converter.docling_client import convert_file_to_markdown
 md = convert_file_to_markdown(Path("report.pdf"), poll_interval=5.0, document_timeout=3600)
 ```
 
-TLS verification is disabled by default (`verify=False`) for internally hosted
-instances using a private CA.
+TLS certificates are verified by default. For an internally hosted instance with a
+private CA, pass the CA bundle path (`verify="/path/to/ca.pem"`) rather than disabling
+verification; `verify=False` is still accepted as a last resort.
 
 ## Bulk conversion helpers
 
-`create_markdown_from_column` and `create_text_from_column` convert PDFs from a DataFrame column into a zip archive. Files already in the zip are skipped unless `replace_all=True`. Only successful (non-blank) conversions are written.
+`create_markdown_from_column` and `create_text_from_column` convert PDFs from a DataFrame column into a zip archive. Files already in the zip are skipped unless `replace_all=True`. Only successful conversions are written, where success is decided by the backend and not by output length: a document that legitimately converts to nothing is written as an empty file so it is not retried on every run.
+
+A missing backend extra or an unknown method name aborts the whole run instead of counting as a per-document failure.
 
 Optional parameters for long-running / incremental jobs:
 
-- `max_failures: int | None = None` — after a filename has failed this many times across runs (empty output, download or subprocess failure), skip it on later runs. Failure counts are stored next to the zip as `{zip_stem}.failures.json`. A later successful write clears the entry. `None` (default) retries forever.
+- `max_failures: int | None = None` — after a filename has failed this many times across runs (download, conversion or zip-write failure), skip it on later runs. Failure counts are stored next to the zip as `{zip_stem}.failures.json`. A later successful write clears the entry. `None` (default) retries forever.
 - `shuffle: bool = False` — shuffle remaining work after filtering existing files and exhausted failures, so each run tries remaining documents in a different order (helps with transient / rate-limit failures).
 - `max_workers: int = 1` — number of parallel conversions (`1` = sequential). Especially useful with `method="docling-serve"`; start with 2–4 and raise carefully until you know the server’s limit. Zip writes and failure-count updates stay serial.
 
@@ -149,7 +156,7 @@ create_markdown_from_column(
 
 - **Subprocess Crash Isolation**: Local conversion backends (`docling`, `pymupdf`, `pymupdf4llm`, `pdfplumber`) run inside a subprocess per document. This ensures heavy C-libraries or memory leaks in PDF parsers do not crash the primary orchestration process.
 - **In-Process Remote Backend**: Remote backends like `docling-serve` run in-process using `httpx`, avoiding subprocess overhead since conversion logic runs on the remote server.
-- **CLI Helper Scripts**: `convert_single_pdf2md.py` and `convert_single_pdf2txt.py` write converted content byte-for-byte to `stdout` and logs/errors to `stderr`.
+- **CLI Helper Scripts**: `convert_single_pdf2md.py` and `convert_single_pdf2txt.py` write converted content byte-for-byte to `stdout` and logs/errors to `stderr`. Dedicated exit codes (`3` for missing dependencies, `4` for unknown backends) signal misconfiguration to abort batch processing immediately instead of consuming per-document failure retry budgets.
 
 ## Backend Heuristics & Features
 

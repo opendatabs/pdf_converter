@@ -16,7 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from pdf_converter import backends
-from pdf_converter.backends import MissingBackendDependency
+from pdf_converter.backends import MissingBackendDependency, UnknownBackend
 
 load_dotenv()
 
@@ -45,9 +45,6 @@ class Converter:
         if self.doc_image_folder.exists():
             shutil.rmtree(self.doc_image_folder, ignore_errors=True)
 
-    def has_image_extraction(self):
-        return self.lib.lower() in ["mistral-ocr"]
-
     def extract_images_from_pdf(self):
         """Write every embedded image of the source PDF into the image folder."""
         from pdf_converter.backends import images
@@ -70,6 +67,7 @@ class Converter:
         return Path(temp_zip_path)
 
     def get_zipped_images(self):
+        self.doc_image_folder.mkdir(parents=True, exist_ok=True)
         shutil.make_archive(str(self.doc_image_folder), "zip", self.doc_image_folder)
         return f"{self.doc_image_folder}.zip"
 
@@ -107,7 +105,7 @@ class Converter:
         self.last_error = None
         try:
             self.md_content = backends.convert_to_markdown(lib, self.input_file, **options)
-        except MissingBackendDependency:
+        except (MissingBackendDependency, UnknownBackend):
             raise
         except Exception as e:
             self.last_error = f"Conversion with {lib} failed: {e}"

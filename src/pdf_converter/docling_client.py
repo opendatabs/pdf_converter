@@ -242,7 +242,7 @@ def poll_task(
     """
     url = f"{base_url}/v1/status/poll/{task_id}"
     now = time.monotonic()
-    deadline = now + queue_timeout + document_timeout
+    deadline = now + queue_timeout
     not_found_deadline = now + _POLL_NOT_FOUND_GRACE_SECONDS
     seen_started = False
     last_status = ""
@@ -250,9 +250,11 @@ def poll_task(
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            budget = (
+                f"document_timeout={document_timeout:.0f}s" if seen_started else f"queue_timeout={queue_timeout:.0f}s"
+            )
             raise DoclingServeError(
-                f"task {task_id} did not finish in time (last status={last_status or 'unknown'}; "
-                f"queue_timeout={queue_timeout:.0f}s, document_timeout={document_timeout:.0f}s)"
+                f"task {task_id} did not finish in time (last status={last_status or 'unknown'}; exceeded {budget})"
             )
 
         wait = max(0.0, min(poll_wait, remaining))
@@ -272,6 +274,8 @@ def poll_task(
             )
             time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
             continue
+        except httpx.HTTPError as exc:
+            raise DoclingServeError(f"poll failed for task {task_id}: {_describe_http_error(exc)}") from exc
 
         if response.status_code == 404 and time.monotonic() < not_found_deadline:
             logger.warning("Docling task %s not found yet; retrying within grace period", task_id)
@@ -348,7 +352,9 @@ def fetch_result(
             body is a zip archive rather than JSON.
 
     Returns:
-        Markdown content (possibly empty for a document with no text).
+        Markdown content. An empty string means the server converted the
+        document to no text; a *missing* ``md_content`` is an error, not an
+        empty document.
 
     Raises:
         DoclingServeError: If the result is missing, malformed or unsuccessful.
@@ -381,9 +387,12 @@ def fetch_result(
     if not isinstance(document, dict):
         raise DoclingServeError(f"task {task_id} result document is not a dict: {document!r}")
 
-    md_content = document.get("md_content")
-    if md_content is None:
-        return ""
+    if document.get("md_content") is None:
+        raise DoclingServeError(
+            f"task {task_id} result has no md_content (keys={sorted(document)}). "
+            f"The server did not return markdown — check that 'md' is in to_formats."
+        )
+    md_content = document["md_content"]
     if not isinstance(md_content, str):
         raise DoclingServeError(f"task {task_id} md_content is not a string: {type(md_content)!r}")
     return md_content
@@ -398,7 +407,7 @@ def convert_file_to_markdown(
     document_timeout: float = DEFAULT_DOCUMENT_TIMEOUT_SECONDS,
     submit_timeout: float = DEFAULT_SUBMIT_TIMEOUT_SECONDS,
     result_timeout: float = DEFAULT_RESULT_TIMEOUT_SECONDS,
-    verify: bool = False,
+    verify: bool | str = True,
     **conversion_options: Any,
 ) -> str:
     """Convert a single PDF to markdown via the Docling Serve async API.
@@ -415,8 +424,9 @@ def convert_file_to_markdown(
             to the server as its own per-document timeout.
         submit_timeout: HTTP timeout for the upload.
         result_timeout: HTTP timeout for the result fetch.
-        verify: TLS verification for the HTTP client. Defaults to False for
-            internally hosted instances using a private CA.
+        verify: TLS verification for the HTTP client. Certificates are verified
+            by default; pass a CA bundle path for a privately signed instance,
+            or ``False`` to disable verification entirely (last resort).
         **conversion_options: Forwarded to :func:`build_form_data`.
 
     Returns:
