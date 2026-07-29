@@ -1,19 +1,34 @@
 [project]
 name = "pdf-converter"
-version = "0.1.4"
+version = "0.2.0"
 description = "Convert PDF's to something more machine-readable"
 readme = "README.md"
 requires-python = ">=3.12"
+# Core: only what the batch orchestration itself needs. Every conversion backend
+# lives behind an extra, so you install just the ones you use.
 dependencies = [
-    "docling>=2.30.0",
-    "httpx>=0.28.1",
-    "markdown>=3.8",
-    "pdfkit>=1.0.0",
-    "pdfplumber>=0.11.6",
-    "pymupdf>=1.25.5",
-    "pymupdf4llm>=0.0.21",
+    "pandas>=2.2.0",
     "python-dotenv>=1.1.0",
     "requests>=2.32.3",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+# One extra per conversion method, named after the method.
+docling-serve = ["httpx>=0.28.1"]
+docling = ["docling>=2.30.0"]
+pymupdf4llm = ["pymupdf4llm>=0.0.21"]
+pymupdf = ["pymupdf>=1.25.5"]
+pdfplumber = ["pdfplumber>=0.11.6"]
+# Embedded-image extraction, usable alongside any method.
+images = ["pymupdf>=1.25.5", "pillow>=10.0.0"]
+all = [
+    "docling>=2.30.0",
+    "httpx>=0.28.1",
+    "pdfplumber>=0.11.6",
+    "pillow>=10.0.0",
+    "pymupdf>=1.25.5",
+    "pymupdf4llm>=0.0.21",
 ]
 
 [build-system]
@@ -27,6 +42,10 @@ packages = ["src/pdf_converter"]
 dev = [
     "ruff>=0.11.8",
 ]
+
+[tool.uv]
+# The backend extras are independent; installing several at once is fine.
+default-groups = ["dev"]
 
 [tool.ruff]
 target-version = "py312"

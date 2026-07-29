@@ -14,17 +14,20 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 
+from pdf_converter import backends
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONVERT_SCRIPT_MD = SCRIPT_DIR / "convert_single_pdf2md.py"
 CONVERT_SCRIPT_TXT = SCRIPT_DIR / "convert_single_pdf2txt.py"
 
-# Matches Docling Serve document_timeout (1h) plus submit/result HTTP overhead.
 DEFAULT_DOCUMENT_TIMEOUT_SECONDS = 3600
 DEFAULT_CONVERSION_TIMEOUT_SECONDS = DEFAULT_DOCUMENT_TIMEOUT_SECONDS + 300
+DOWNLOAD_TIMEOUT_SECONDS = 60
+
+_FATAL_CONVERSION_ERRORS = (backends.MissingBackendDependency, backends.UnknownBackend)
 
 
 def safe_filename(name):
-    # Convert name to string and replace invalid characters
     if not isinstance(name, str):
         name = str(name)
     return re.sub(r"[^a-zA-Z0-9_\-.]", "_", name)
@@ -56,7 +59,6 @@ def _ensure_zip(zip_path: Path) -> set[str]:
 
 
 def _build_filenames(series: pd.Series, suffix: str) -> pd.Series:
-    # Vectorized safe filenames
     return series.astype(str).map(safe_filename) + suffix
 
 
@@ -138,7 +140,6 @@ def _prepare_batch_rows(
     valid = valid.drop_duplicates(subset="__filename", keep="first")
 
     if max_failures is not None:
-        # Drop stale failure entries for files already present in the zip
         for name in [n for n in failures if n in existing]:
             del failures[name]
 
@@ -166,9 +167,16 @@ def _handle_conversion_result(
     label: str,
     failure_reason: str | None = None,
 ) -> bool:
-    """Write successful content to the zip; update failure counts. Returns True if written."""
+    """Write successful content to the zip; update failure counts. Returns True if written.
+
+    Success is decided by ``failure_reason``, not by content length: a document
+    that legitimately converts to nothing is written as an empty file so it is
+    not retried on every subsequent run.
+    """
     wrote = False
-    if content.strip():
+    if failure_reason is None:
+        if not content.strip():
+            logging.warning(f"{filename}: conversion succeeded but produced no content")
         try:
             replace_in_zip(zip_path, filename, content)
             existing.add(filename)
@@ -210,29 +218,34 @@ def _run_batch_conversions(
     def _convert(url: str) -> tuple[str, str | None]:
         return convert_fn(url, method, conversion_timeout=conversion_timeout)
 
-    if workers == 1:
-        for url, filename in row_list:
-            content, failure_reason = _convert(url)
-            _handle_conversion_result(
-                content, filename, zip_path, existing, failures, max_failures, label, failure_reason
-            )
-            progress_bar.update(1)
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_filename = {executor.submit(_convert, url): filename for url, filename in row_list}
-            for future in as_completed(future_to_filename):
-                filename = future_to_filename[future]
-                try:
-                    content, failure_reason = future.result()
-                except Exception as e:
-                    logging.error(f"Unexpected conversion error for {filename}: {e}")
-                    content, failure_reason = "", str(e)
+    try:
+        if workers == 1:
+            for url, filename in row_list:
+                content, failure_reason = _convert(url)
                 _handle_conversion_result(
                     content, filename, zip_path, existing, failures, max_failures, label, failure_reason
                 )
                 progress_bar.update(1)
-
-    progress_bar.close()
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_filename = {executor.submit(_convert, url): filename for url, filename in row_list}
+                for future in as_completed(future_to_filename):
+                    filename = future_to_filename[future]
+                    try:
+                        content, failure_reason = future.result()
+                    except _FATAL_CONVERSION_ERRORS:
+                        for pending in future_to_filename:
+                            pending.cancel()
+                        raise
+                    except Exception as e:
+                        logging.error(f"Unexpected conversion error for {filename}: {e}")
+                        content, failure_reason = "", str(e)
+                    _handle_conversion_result(
+                        content, filename, zip_path, existing, failures, max_failures, label, failure_reason
+                    )
+                    progress_bar.update(1)
+    finally:
+        progress_bar.close()
 
 
 def unzip_to_folder(zip_path: Path, target_dir: Path, overwrite: bool = False):
@@ -253,72 +266,121 @@ def unzip_to_folder(zip_path: Path, target_dir: Path, overwrite: bool = False):
             zf.extract(member, target_dir)
 
 
+def _download_pdf(pdf_url: str, pdf_path: Path) -> str | None:
+    """Stream a PDF to ``pdf_path``. Returns a failure reason, or None on success."""
+    logging.info(f"Downloading PDF: {pdf_url}")
+    try:
+        with requests.get(pdf_url, timeout=DOWNLOAD_TIMEOUT_SECONDS, stream=True) as response:
+            response.raise_for_status()
+            with open(pdf_path, "wb") as file:
+                for chunk in response.iter_content(chunk_size=1 << 16):
+                    file.write(chunk)
+    except Exception as e:
+        reason = f"Failed to download PDF: {e}"
+        logging.error(reason)
+        return reason
+    return None
+
+
+def _run_conversion_subprocess(
+    script: Path,
+    pdf_path: Path,
+    method: str,
+    conversion_timeout: float,
+) -> tuple[str, str | None]:
+    """Run a conversion script in a subprocess for crash isolation.
+
+    Returns:
+        A tuple of ``(content, failure_reason)`` for per-document outcomes.
+
+    Raises:
+        MissingBackendDependency: If the script reported a missing backend extra.
+        UnknownBackend: If the script reported an unknown method name.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script), str(pdf_path), method],
+            capture_output=True,
+            text=True,
+            timeout=conversion_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        reason = f"Conversion timed out after {conversion_timeout}s"
+        logging.error(reason)
+        return "", reason
+    except Exception as e:
+        reason = f"Unexpected error in subprocess: {e}"
+        logging.error(reason)
+        return "", reason
+
+    if result.returncode != 0:
+        reason = (result.stderr or result.stdout or "subprocess failed with no output").strip()
+        if result.returncode == backends.EXIT_MISSING_DEPENDENCY:
+            raise backends.MissingBackendDependency(reason)
+        if result.returncode == backends.EXIT_UNKNOWN_BACKEND:
+            raise backends.UnknownBackend(reason)
+        logging.error(f"[ERROR] Subprocess failed: {reason}")
+        return "", reason
+    return result.stdout, None
+
+
 def convert_pdf_to_md(
     pdf_url: str,
     method: str,
     pdf_path: Path | None = None,
     *,
     conversion_timeout: float = DEFAULT_CONVERSION_TIMEOUT_SECONDS,
+    **docling_options,
 ) -> tuple[str, str | None]:
     """
     Downloads a PDF from a URL and converts it to Markdown using the specified conversion method.
 
+    Remote backends (see ``pdf_converter.backends.REMOTE_BACKENDS``, currently
+    ``docling-serve``) run in-process: the file is submitted as an async job and
+    its task id is polled until done. Local backends run in a subprocess for
+    crash isolation.
+
     Args:
         pdf_url (str): The URL of the PDF to download.
-        method (str): The conversion method to use (e.g. 'poppler', 'pdf2text').
+        method (str): The conversion method to use (e.g. 'docling-serve', 'pymupdf4llm').
         pdf_path (Path, optional): Path to save the downloaded PDF. If omitted, a unique
             temporary file is created and removed after conversion.
-        conversion_timeout: Max seconds for the conversion subprocess. Defaults to 1h plus
-            overhead so Docling Serve async jobs can use the full document timeout.
+        conversion_timeout: Max seconds for the conversion subprocess. Ignored by remote
+            backends, which use their own submit/poll/result timeouts.
+        **docling_options: Extra options forwarded to the remote backend.
 
     Returns:
         A tuple of ``(markdown_content, failure_reason)``. On success, ``failure_reason``
         is ``None``. On failure, content is empty and ``failure_reason`` explains why.
+
+    Raises:
+        UnknownBackend: If ``method`` is not a known markdown backend.
+        MissingBackendDependency: If the backend's extra is not installed.
     """
+    backends.validate_method(method, "markdown")
+
     own_temp = pdf_path is None
     if own_temp:
         fd, temp_name = tempfile.mkstemp(suffix=".pdf")
-        # Close the low-level fd; we reopen via Path for writing.
         os.close(fd)
         pdf_path = Path(temp_name)
 
     try:
-        logging.info(f"Downloading PDF: {pdf_url}")
-        try:
-            r_pdf = requests.get(pdf_url, timeout=10)
-            r_pdf.raise_for_status()
-            with open(pdf_path, "wb") as file:
-                file.write(r_pdf.content)
-        except Exception as e:
-            reason = f"Failed to download PDF: {e}"
-            logging.error(reason)
+        reason = _download_pdf(pdf_url, pdf_path)
+        if reason is not None:
             return "", reason
 
-        # Subprocess for crash isolation
-        try:
-            result = subprocess.run(
-                [sys.executable, str(CONVERT_SCRIPT_MD), str(pdf_path), method],
-                capture_output=True,
-                text=True,
-                timeout=conversion_timeout,
-            )
-            if result.returncode != 0:
-                reason = (result.stderr or result.stdout or "subprocess failed with no output").strip()
-                logging.error(f"[ERROR] Subprocess failed: {reason}")
+        if backends.is_remote(method):
+            try:
+                return backends.convert_to_markdown(method, pdf_path, **docling_options), None
+            except _FATAL_CONVERSION_ERRORS:
+                raise
+            except Exception as e:
+                reason = f"{method} conversion failed: {e}"
+                logging.error(f"[ERROR] {reason} ({pdf_url})")
                 return "", reason
-            if not result.stdout.strip():
-                reason = (result.stderr or "empty conversion output").strip()
-                logging.error(f"[ERROR] Conversion produced empty output: {reason}")
-                return "", reason
-            return result.stdout, None
-        except subprocess.TimeoutExpired:
-            reason = f"Conversion timed out after {conversion_timeout}s"
-            logging.error(reason)
-            return "", reason
-        except Exception as e:
-            reason = f"Unexpected error in subprocess: {e}"
-            logging.error(reason)
-            return "", reason
+
+        return _run_conversion_subprocess(CONVERT_SCRIPT_MD, pdf_path, method, conversion_timeout)
     finally:
         if own_temp and pdf_path is not None:
             pdf_path.unlink(missing_ok=True)
@@ -340,7 +402,9 @@ def create_markdown_from_column(
     Convert PDFs referenced in a DataFrame column to Markdown and store them in a zip.
 
     Files already present in the zip are skipped unless ``replace_all`` is True.
-    Only successful (non-blank) conversions are written.
+    Only successful conversions are written — but success is decided by the
+    backend, not by output length: a document that legitimately converts to
+    nothing is written as an empty file so it is not retried on every run.
 
     Args:
         df: Source DataFrame.
@@ -351,8 +415,8 @@ def create_markdown_from_column(
         md_name_column: Column used to build output filenames.
         replace_all: If True, re-convert even when the target already exists in the zip.
         max_failures: If set, skip a filename after it has failed this many times across
-            runs (empty/blank output, download or subprocess failure). ``None`` retries
-            forever (default). A later successful write clears the failure entry.
+            runs (download, conversion or zip-write failure). ``None`` retries forever
+            (default). A later successful write clears the failure entry.
         shuffle: If True, shuffle remaining work after filtering existing files and
             exhausted failures. Helps with transient / rate-limit failures by trying
             documents in a different order each run.
@@ -422,7 +486,14 @@ def convert_pdf_to_txt(
     Returns:
         A tuple of ``(text_content, failure_reason)``. On success, ``failure_reason`` is
         ``None``. On failure, content is empty and ``failure_reason`` explains why.
+
+    Raises:
+        UnknownBackend: If ``method`` is not a known text backend. Markdown-only
+            backends such as ``docling-serve`` are rejected here.
+        MissingBackendDependency: If the backend's extra is not installed.
     """
+    backends.validate_method(method, "text")
+
     own_temp = pdf_path is None
     if own_temp:
         fd, temp_name = tempfile.mkstemp(suffix=".pdf")
@@ -430,41 +501,11 @@ def convert_pdf_to_txt(
         pdf_path = Path(temp_name)
 
     try:
-        logging.info(f"Downloading PDF: {pdf_url}")
-        try:
-            r_pdf = requests.get(pdf_url, timeout=10)
-            r_pdf.raise_for_status()
-            with open(pdf_path, "wb") as file:
-                file.write(r_pdf.content)
-        except Exception as e:
-            reason = f"Failed to download PDF: {e}"
-            logging.error(reason)
+        reason = _download_pdf(pdf_url, pdf_path)
+        if reason is not None:
             return "", reason
 
-        try:
-            result = subprocess.run(
-                [sys.executable, str(CONVERT_SCRIPT_TXT), str(pdf_path), method],
-                capture_output=True,
-                text=True,
-                timeout=conversion_timeout,
-            )
-            if result.returncode != 0:
-                reason = (result.stderr or result.stdout or "subprocess failed with no output").strip()
-                logging.error(f"[ERROR] Subprocess failed: {reason}")
-                return "", reason
-            if not result.stdout.strip():
-                reason = (result.stderr or "empty conversion output").strip()
-                logging.error(f"[ERROR] Conversion produced empty output: {reason}")
-                return "", reason
-            return result.stdout, None
-        except subprocess.TimeoutExpired:
-            reason = f"Conversion timed out after {conversion_timeout}s"
-            logging.error(reason)
-            return "", reason
-        except Exception as e:
-            reason = f"Unexpected error in subprocess: {e}"
-            logging.error(reason)
-            return "", reason
+        return _run_conversion_subprocess(CONVERT_SCRIPT_TXT, pdf_path, method, conversion_timeout)
     finally:
         if own_temp and pdf_path is not None:
             pdf_path.unlink(missing_ok=True)
@@ -486,7 +527,9 @@ def create_text_from_column(
     Convert PDFs referenced in a DataFrame column to plain text and store them in a zip.
 
     Files already present in the zip are skipped unless ``replace_all`` is True.
-    Only successful (non-blank) conversions are written.
+    Only successful conversions are written — but success is decided by the
+    backend, not by output length: a document that legitimately converts to
+    nothing is written as an empty file so it is not retried on every run.
 
     Args:
         df: Source DataFrame.
@@ -497,8 +540,8 @@ def create_text_from_column(
         txt_name_column: Column used to build output filenames.
         replace_all: If True, re-convert even when the target already exists in the zip.
         max_failures: If set, skip a filename after it has failed this many times across
-            runs (empty/blank output, download or subprocess failure). ``None`` retries
-            forever (default). A later successful write clears the failure entry.
+            runs (download, conversion or zip-write failure). ``None`` retries forever
+            (default). A later successful write clears the failure entry.
         shuffle: If True, shuffle remaining work after filtering existing files and
             exhausted failures. Helps with transient / rate-limit failures by trying
             documents in a different order each run.
