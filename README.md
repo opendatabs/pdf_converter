@@ -82,9 +82,16 @@ pip install "git+https://github.com/opendatabs/pdf_converter@main"
 ## Docling Serve
 
 `method="docling-serve"` converts against a remote [Docling Serve](https://github.com/docling-project/docling-serve)
-instance using its asynchronous API: one file is submitted to
-`POST /v1/convert/file/async`, its `task_id` is polled at `GET /v1/status/poll/{task_id}`
-until the task is terminal, then the markdown is fetched from `GET /v1/result/{task_id}`.
+instance using its asynchronous **source** API:
+
+1. `POST /v1/convert/source/async` with a JSON body — either
+   `{"kind": "http", "url": "..."}` (Docling fetches the PDF) or
+   `{"kind": "file", "filename": "...", "base64_string": "..."}` (local file)
+2. Poll `GET /v1/status/poll/{task_id}` until the task is terminal
+3. Fetch markdown from `GET /v1/result/{task_id}`
+
+`create_markdown_from_column` / `convert_pdf_to_md` pass the PDF URL straight
+through (no local download) when using `docling-serve`.
 
 Configure it with two environment variables (a `.env` file is read automatically):
 
@@ -109,12 +116,16 @@ Notes on the polling loop:
   `document_timeout`), so a long server queue cannot eat the conversion budget.
   `document_timeout` restarts once the task is first reported as started.
 
-For a single file you can bypass the batch helpers entirely:
+For a single file or URL you can bypass the batch helpers entirely:
 
 ```python
 from pathlib import Path
 from pdf_converter.docling_client import convert_file_to_markdown
 
+# Docling Serve fetches the PDF itself
+md = convert_file_to_markdown(source_url="https://example.com/report.pdf")
+
+# Or send a local file as base64 (still JSON, not multipart)
 md = convert_file_to_markdown(Path("report.pdf"), poll_interval=5.0, document_timeout=3600)
 ```
 

@@ -96,12 +96,13 @@ def validate_method(method: str, kind: str = "markdown") -> None:
     _resolve(registry, method, kind)
 
 
-def convert_to_markdown(method: str, input_file: Path, **options) -> str:
+def convert_to_markdown(method: str, input_file: Path | None = None, **options) -> str:
     """Convert a PDF to markdown with the backend named ``method``.
 
     Args:
         method: Backend name, e.g. ``"docling-serve"``.
-        input_file: PDF to convert.
+        input_file: PDF to convert. Optional for remote backends that receive a
+            ``source_url`` in ``options`` instead.
         **options: Backend-specific options. Backends that do not understand
             them log a warning.
 

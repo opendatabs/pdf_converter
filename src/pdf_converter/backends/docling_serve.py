@@ -4,6 +4,9 @@ Extra: ``docling-serve`` (installs ``httpx``).
 
 Requires ``DOCLING_HTTP_CLIENT`` in the environment; ``DOCLING_API_KEY`` is
 optional for unauthenticated internal instances.
+
+Uses ``POST /v1/convert/source/async``: pass ``source_url`` so Docling Serve
+fetches the PDF itself, or omit it to upload a local file as base64.
 """
 
 from pathlib import Path
@@ -28,13 +31,14 @@ DEFAULTS = {
 }
 
 
-def to_markdown(input_file: Path, **options) -> str:
-    """Convert a PDF to markdown via the Docling Serve async API.
+def to_markdown(input_file: Path | None = None, **options) -> str:
+    """Convert a PDF to markdown via the Docling Serve async source API.
 
     Args:
-        input_file: PDF to convert.
+        input_file: Local PDF used when ``source_url`` is not set.
         **options: Forwarded to
             :func:`pdf_converter.docling_client.convert_file_to_markdown`.
+            Set ``source_url`` to have Docling Serve fetch the document.
 
     Returns:
         Markdown content.
