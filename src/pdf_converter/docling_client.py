@@ -17,14 +17,20 @@ Polling paces itself with an explicit sleep. The server-side ``wait`` query
 parameter is sent as a best-effort hint only, because docling-serve does not
 reliably honour it (docling-serve#388) — relying on it turns the loop into a
 busy loop against the server.
+
+API-gateway rate limits (e.g. 1000 requests / 60s) are respected with a
+process-wide sliding-window limiter (``DOCLING_MAX_REQUESTS_PER_MINUTE``) and
+retries with backoff on transient HTTP statuses including 429.
 """
 
 import base64
 import io
 import logging
 import os
+import threading
 import time
 import zipfile
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -45,14 +51,47 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_POLL_WAIT_SECONDS = 30.0
 DEFAULT_SUBMIT_TIMEOUT_SECONDS = 120.0
 DEFAULT_RESULT_TIMEOUT_SECONDS = 120.0
+# Headroom under a typical gateway global limit of 1000 requests / 60s.
+DEFAULT_MAX_REQUESTS_PER_MINUTE = 900
+DEFAULT_HTTP_MAX_RETRIES = 8
+DEFAULT_HTTP_RETRY_BASE_SECONDS = 2.0
+DEFAULT_HTTP_RETRY_MAX_SECONDS = 60.0
 
 _POLL_TIMEOUT_BUFFER_SECONDS = 15.0
 _POLL_NOT_FOUND_GRACE_SECONDS = 60.0
 _TRANSIENT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_RATE_LIMIT_WINDOW_SECONDS = 60.0
+
+_rate_limiter_lock = threading.Lock()
+_rate_limiter: "_SlidingWindowRateLimiter | None" = None
 
 
 class DoclingServeError(RuntimeError):
     """Raised when a Docling Serve conversion cannot be completed."""
+
+
+class _SlidingWindowRateLimiter:
+    """Limit how many requests may start inside a rolling time window."""
+
+    def __init__(self, max_requests: int, window_seconds: float = _RATE_LIMIT_WINDOW_SECONDS) -> None:
+        self._max_requests = max_requests
+        self._window_seconds = window_seconds
+        self._timestamps: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        if self._max_requests <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._timestamps and now - self._timestamps[0] >= self._window_seconds:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self._max_requests:
+                    self._timestamps.append(now)
+                    return
+                sleep_for = self._window_seconds - (now - self._timestamps[0]) + 0.01
+            time.sleep(max(sleep_for, 0.01))
 
 
 def _describe_http_error(exc: BaseException) -> str:
@@ -73,6 +112,112 @@ def _describe_response(response: httpx.Response) -> str:
     except Exception:  # pragma: no cover - binary/undecodable body
         body = repr(response.content[:200])
     return f"{body[:500]}..." if len(body) > 500 else body
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+
+
+def get_max_requests_per_minute() -> int:
+    """Return the client-side gateway request budget (0 disables pacing)."""
+    return _env_int("DOCLING_MAX_REQUESTS_PER_MINUTE", DEFAULT_MAX_REQUESTS_PER_MINUTE)
+
+
+def get_rate_limiter() -> _SlidingWindowRateLimiter:
+    """Return the process-wide rate limiter (created once from env)."""
+    global _rate_limiter
+    with _rate_limiter_lock:
+        if _rate_limiter is None:
+            max_requests = get_max_requests_per_minute()
+            _rate_limiter = _SlidingWindowRateLimiter(max_requests)
+            if max_requests > 0:
+                logger.info(
+                    "Docling client rate limit: %s requests / %.0fs",
+                    max_requests,
+                    _RATE_LIMIT_WINDOW_SECONDS,
+                )
+            else:
+                logger.info("Docling client rate limit: disabled")
+        return _rate_limiter
+
+
+def _retry_delay_seconds(attempt: int, response: httpx.Response | None = None) -> float:
+    """Compute sleep before the next retry; prefer ``Retry-After`` when present."""
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), DEFAULT_HTTP_RETRY_MAX_SECONDS)
+            except ValueError:
+                pass
+    delay = DEFAULT_HTTP_RETRY_BASE_SECONDS * (2**attempt)
+    return min(delay, DEFAULT_HTTP_RETRY_MAX_SECONDS)
+
+
+def _http_request(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: httpx.Timeout | float,
+    max_retries: int = DEFAULT_HTTP_MAX_RETRIES,
+    rate_limiter: _SlidingWindowRateLimiter | None = None,
+    **kwargs: Any,
+) -> httpx.Response:
+    """Send an HTTP request with rate limiting and retries on transient failures."""
+    limiter = rate_limiter if rate_limiter is not None else get_rate_limiter()
+    last_response: httpx.Response | None = None
+
+    for attempt in range(max_retries + 1):
+        limiter.acquire()
+        try:
+            response = client.request(method, url, headers=headers, timeout=timeout, **kwargs)
+        except httpx.TransportError as exc:
+            if attempt >= max_retries:
+                raise
+            delay = _retry_delay_seconds(attempt)
+            logger.warning(
+                "Docling %s %s failed transiently (%s); retrying in %.1fs (%d/%d)",
+                method,
+                url,
+                _describe_http_error(exc),
+                delay,
+                attempt + 1,
+                max_retries,
+            )
+            time.sleep(delay)
+            continue
+
+        if response.status_code in _TRANSIENT_STATUS_CODES:
+            last_response = response
+            if attempt >= max_retries:
+                return response
+            delay = _retry_delay_seconds(attempt, response)
+            logger.warning(
+                "Docling %s %s returned HTTP %s; retrying in %.1fs (%d/%d): %s",
+                method,
+                url,
+                response.status_code,
+                delay,
+                attempt + 1,
+                max_retries,
+                _describe_response(response),
+            )
+            time.sleep(delay)
+            continue
+        return response
+
+    if last_response is not None:
+        return last_response
+    raise DoclingServeError(f"{method} {url} failed after {max_retries} retries")
 
 
 def get_base_url() -> str:
@@ -209,7 +354,14 @@ def submit_source_task(
     )
     started = time.monotonic()
     try:
-        response = client.post(url, headers=headers, json=payload, timeout=timeout_config)
+        response = _http_request(
+            client,
+            "POST",
+            url,
+            headers=headers,
+            timeout=timeout_config,
+            json=payload,
+        )
     except httpx.TimeoutException as exc:
         elapsed = time.monotonic() - started
         raise DoclingServeError(
@@ -279,6 +431,7 @@ def poll_task(
     not_found_deadline = now + _POLL_NOT_FOUND_GRACE_SECONDS
     seen_started = False
     last_status = ""
+    rate_limiter = get_rate_limiter()
 
     while True:
         remaining = deadline - time.monotonic()
@@ -292,6 +445,9 @@ def poll_task(
 
         wait = max(0.0, min(poll_wait, remaining))
         try:
+            # Poll has its own deadline loop; do not stack submit-style retries here.
+            # Still pace against the gateway budget and sleep longer on 429.
+            rate_limiter.acquire()
             response = client.get(
                 url,
                 headers=headers,
@@ -315,13 +471,20 @@ def poll_task(
             time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
             continue
         if response.status_code in _TRANSIENT_STATUS_CODES:
+            # 429 usually means the gateway window is exhausted; wait longer than a normal poll tick.
+            if response.status_code == 429:
+                delay = max(_retry_delay_seconds(0, response), min(30.0, _RATE_LIMIT_WINDOW_SECONDS / 2))
+            else:
+                delay = poll_interval
+            delay = min(delay, max(0.0, deadline - time.monotonic()))
             logger.warning(
-                "Docling poll for task %s returned HTTP %s; retrying (%.0fs left)",
+                "Docling poll for task %s returned HTTP %s; retrying in %.1fs (%.0fs left)",
                 task_id,
                 response.status_code,
+                delay,
                 deadline - time.monotonic(),
             )
-            time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+            time.sleep(delay)
             continue
         if response.status_code >= 400:
             raise DoclingServeError(
@@ -395,7 +558,13 @@ def fetch_result(
     url = f"{base_url}/v1/result/{task_id}"
     timeout_config = httpx.Timeout(connect=30.0, read=timeout, write=timeout, pool=30.0)
     try:
-        response = client.get(url, headers=headers, timeout=timeout_config)
+        response = _http_request(
+            client,
+            "GET",
+            url,
+            headers=headers,
+            timeout=timeout_config,
+        )
     except httpx.HTTPError as exc:
         raise DoclingServeError(f"result fetch failed for task {task_id}: {_describe_http_error(exc)}") from exc
 

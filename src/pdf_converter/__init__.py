@@ -336,16 +336,15 @@ def convert_pdf_to_md(
     Downloads a PDF from a URL and converts it to Markdown using the specified conversion method.
 
     Remote backends (see ``pdf_converter.backends.REMOTE_BACKENDS``, currently
-    ``docling-serve``) run in-process and pass ``pdf_url`` to Docling Serve via
-    ``/v1/convert/source/async`` — no local download. Local backends download
-    first, then run in a subprocess for crash isolation.
+    ``docling-serve``) run in-process: the file is downloaded locally, then
+    submitted as a base64 source job and polled until done. Local backends run
+    in a subprocess for crash isolation.
 
     Args:
         pdf_url (str): The URL of the PDF to download.
         method (str): The conversion method to use (e.g. 'docling-serve', 'pymupdf4llm').
         pdf_path (Path, optional): Path to save the downloaded PDF. If omitted, a unique
-            temporary file is created and removed after conversion. Unused for remote
-            backends.
+            temporary file is created and removed after conversion.
         conversion_timeout: Max seconds for the conversion subprocess. Ignored by remote
             backends, which use their own submit/poll/result timeouts.
         **docling_options: Extra options forwarded to the remote backend.
@@ -360,19 +359,6 @@ def convert_pdf_to_md(
     """
     backends.validate_method(method, "markdown")
 
-    if backends.is_remote(method):
-        try:
-            return (
-                backends.convert_to_markdown(method, source_url=pdf_url, **docling_options),
-                None,
-            )
-        except _FATAL_CONVERSION_ERRORS:
-            raise
-        except Exception as e:
-            reason = f"{method} conversion failed: {e}"
-            logging.error(f"[ERROR] {reason} ({pdf_url})")
-            return "", reason
-
     own_temp = pdf_path is None
     if own_temp:
         fd, temp_name = tempfile.mkstemp(suffix=".pdf")
@@ -383,6 +369,16 @@ def convert_pdf_to_md(
         reason = _download_pdf(pdf_url, pdf_path)
         if reason is not None:
             return "", reason
+
+        if backends.is_remote(method):
+            try:
+                return backends.convert_to_markdown(method, pdf_path, **docling_options), None
+            except _FATAL_CONVERSION_ERRORS:
+                raise
+            except Exception as e:
+                reason = f"{method} conversion failed: {e}"
+                logging.error(f"[ERROR] {reason} ({pdf_url})")
+                return "", reason
 
         return _run_conversion_subprocess(CONVERT_SCRIPT_MD, pdf_path, method, conversion_timeout)
     finally:

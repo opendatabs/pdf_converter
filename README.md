@@ -84,21 +84,29 @@ pip install "git+https://github.com/opendatabs/pdf_converter@main"
 `method="docling-serve"` converts against a remote [Docling Serve](https://github.com/docling-project/docling-serve)
 instance using its asynchronous **source** API:
 
-1. `POST /v1/convert/source/async` with a JSON body — either
-   `{"kind": "http", "url": "..."}` (Docling fetches the PDF) or
-   `{"kind": "file", "filename": "...", "base64_string": "..."}` (local file)
+1. `POST /v1/convert/source/async` with a JSON body — typically a local file as
+   `{"kind": "file", "filename": "...", "base64_string": "..."}`. Optional
+   `{"kind": "http", "url": "..."}` is supported only when the host is on the
+   Docling Serve URL allowlist.
 2. Poll `GET /v1/status/poll/{task_id}` until the task is terminal
 3. Fetch markdown from `GET /v1/result/{task_id}`
 
-`create_markdown_from_column` / `convert_pdf_to_md` pass the PDF URL straight
-through (no local download) when using `docling-serve`.
+`create_markdown_from_column` / `convert_pdf_to_md` download the PDF locally,
+then upload it as base64. Passing the URL through to Docling is not used by
+default (many deployments reject external hosts with `URL is not allowed`).
 
 Configure it with two environment variables (a `.env` file is read automatically):
 
 ```bash
 DOCLING_HTTP_CLIENT=https://docling.internal.example/   # required
 DOCLING_API_KEY=...                                     # optional; omitted = no auth header
+DOCLING_MAX_REQUESTS_PER_MINUTE=900                     # optional; 0 disables client pacing
 ```
+
+The client paces requests with a process-wide sliding window (default **900 / 60s**,
+under a common API-gateway cap of 1000 / 60s) and retries transient responses
+(`408`, `425`, `429`, `5xx`) with exponential backoff on submit and result fetch.
+Set `DOCLING_MAX_REQUESTS_PER_MINUTE=0` to disable client-side pacing.
 
 Unlike the other methods this one runs in-process rather than in a subprocess —
 there is no local library to crash, so a subprocess would only add startup cost.
@@ -116,17 +124,17 @@ Notes on the polling loop:
   `document_timeout`), so a long server queue cannot eat the conversion budget.
   `document_timeout` restarts once the task is first reported as started.
 
-For a single file or URL you can bypass the batch helpers entirely:
+For a single file or allowlisted URL you can bypass the batch helpers entirely:
 
 ```python
 from pathlib import Path
 from pdf_converter.docling_client import convert_file_to_markdown
 
-# Docling Serve fetches the PDF itself
-md = convert_file_to_markdown(source_url="https://example.com/report.pdf")
-
-# Or send a local file as base64 (still JSON, not multipart)
+# Local file uploaded as base64 (default batch path)
 md = convert_file_to_markdown(Path("report.pdf"), poll_interval=5.0, document_timeout=3600)
+
+# Only if the host is on Docling Serve's URL allowlist
+md = convert_file_to_markdown(source_url="https://example.com/report.pdf")
 ```
 
 TLS certificates are verified by default. For an internally hosted instance with a
